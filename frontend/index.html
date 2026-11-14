@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>LokaChat</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ SVG icon sprite (stroke icons, use with <svg class="ic"><use href="#i-name"/></svg>) ============ -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></symbol>
+    <symbol id="i-clips" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="m10 8.5 5.5 3.5-5.5 3.5z"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L3 21l1.9-5.4A8 8 0 1 1 21 12z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 9a6 6 0 1 1 12 0c0 6 2.5 7.5 2.5 7.5h-17S6 15 6 9z"/><path d="M10 20a2 2 0 0 0 4 0"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M12 8v8M8 12h8"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="m15 3 6 6-3 1-3.5 3.5.5 4-1.5 1.5-4-4-5 5M9 4l-1 3-3 3 9 9 3-3 3-1"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+    <symbol id="i-heart" viewBox="0 0 24 24"><path d="M12 21s-8-5.2-8-11a4.5 4.5 0 0 1 8-2.8A4.5 4.5 0 0 1 20 10c0 5.8-8 11-8 11z"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M5 5l14 14M19 5 5 19"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M21 3 10 14M21 3l-7 18-4-7-7-4z"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2 20a7 7 0 0 1 14 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14.5a7 7 0 0 1 4 5.5"/></symbol>
+    <symbol id="i-hash" viewBox="0 0 24 24"><path d="M5 9h15M4 15h15M10 3 8 21M16 3l-2 18"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M16 7l3 3"/></symbol>
+  </defs>
+</svg>
+
+<!-- ============ Splash: falling droplet -> ripples -> wordmark ============ -->
+<div id="splash" aria-hidden="true">
+  <div class="sp-drop"></div>
+  <div class="sp-ripple r1"></div>
+  <div class="sp-ripple r2"></div>
+  <div class="sp-brand">
+    <div class="wordmark xl"><span class="w1">Loka</span><span class="w2">Chat</span></div>
+    <div class="sp-dots"><i></i><i></i><i></i></div>
+  </div>
+</div>
+
+<!-- ============ Setup screen (shown only until config.js is filled in) ============ -->
+<section id="setup" class="screen" hidden>
+  <div class="auth-card">
+    <div class="wordmark xl"><span class="w1">Loka</span><span class="w2">Chat</span></div>
+    <h2>Finish setup</h2>
+    <p class="muted">Open <code>frontend/config.js</code> and paste your <b>Supabase URL</b>, <b>Supabase anon key</b> and <b>Koyeb API URL</b>, then reload this page.</p>
+    <ul class="setup-list" id="setup-missing"></ul>
+  </div>
+</section>
+
+<!-- ============ Sign in / Create account gate ============ -->
+<section id="auth" class="screen" hidden>
+  <div class="auth-card">
+    <div class="wordmark xl"><span class="w1">Loka</span><span class="w2">Chat</span></div>
+    <p class="muted auth-tag">Videos, stories, clips and private chat.</p>
+    <div id="auth-body"></div>
+  </div>
+</section>
+
+<!-- ============ App shell ============ -->
+<div id="app" hidden>
+  <aside id="rail" aria-label="Main navigation">
+    <a class="rail-brand" href="#/home" aria-label="LokaChat home">
+      <span class="wordmark"><span class="w1">Loka</span><span class="w2">Chat</span></span>
+      <span class="rail-logo-mini" aria-hidden="true"><span class="w1">L</span><span class="w2">C</span></span>
+    </a>
+    <nav class="rail-nav">
+      <a class="rail-item" data-route="home" href="#/home"><svg class="ic"><use href="#i-home"/></svg><span class="lbl">Home</span></a>
+      <a class="rail-item" data-route="clips" href="#/clips"><svg class="ic"><use href="#i-clips"/></svg><span class="lbl">Clips</span></a>
+      <a class="rail-item" data-route="messages" href="#/messages"><svg class="ic"><use href="#i-chat"/></svg><span class="lbl">Messages</span><b class="badge" id="badge-msg" hidden></b></a>
+      <a class="rail-item" data-route="search" href="#/search"><svg class="ic"><use href="#i-search"/></svg><span class="lbl">Search</span></a>
+      <a class="rail-item" data-route="notifications" href="#/notifications"><svg class="ic"><use href="#i-bell"/></svg><span class="lbl">Notifications</span></a>
+      <a class="rail-item" data-route="post" href="#/post"><svg class="ic"><use href="#i-plus"/></svg><span class="lbl">Post</span></a>
+      <a class="rail-item" data-route="you" href="#/you"><span class="rail-avatar" id="rail-avatar"></span><span class="lbl">You</span></a>
+    </nav>
+    <button class="rail-item rail-pin" data-action="toggle-pin" title="Keep sidebar expanded"><svg class="ic"><use href="#i-pin"/></svg><span class="lbl">Pin sidebar</span></button>
+  </aside>
+  <div class="rail-space"></div>
+
+  <div id="main">
+    <header id="topbar">
+      <a class="wordmark" href="#/home"><span class="w1">Loka</span><span class="w2">Chat</span></a>
+      <div class="top-actions">
+        <a class="icon-btn" href="#/clips" aria-label="Clips"><svg class="ic"><use href="#i-clips"/></svg></a>
+        <a class="icon-btn" href="#/search" aria-label="Search"><svg class="ic"><use href="#i-search"/></svg></a>
+        <a class="icon-btn" href="#/notifications" aria-label="Notifications"><svg class="ic"><use href="#i-bell"/></svg></a>
+      </div>
+    </header>
+    <main id="view" tabindex="-1"></main>
+  </div>
+
+  <nav id="bottomnav" aria-label="Primary">
+    <a data-route="home" href="#/home"><svg class="ic"><use href="#i-home"/></svg><span>Home</span></a>
+    <a data-route="post" href="#/post"><svg class="ic"><use href="#i-plus"/></svg><span>Post</span></a>
+    <a data-route="messages" href="#/messages"><svg class="ic"><use href="#i-chat"/></svg><span>Chats</span><b class="badge" id="badge-msg-m" hidden></b></a>
+    <a data-route="you" href="#/you"><svg class="ic"><use href="#i-user"/></svg><span>You</span></a>
+  </nav>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root" aria-live="polite"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="config.js"></script>
+<script src="crypto.js"></script>
+<script src="api.js"></script>
+<script src="core.js"></script>
+<script src="views.js"></script>
+<script src="chat.js"></script>
+<script src="you.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
