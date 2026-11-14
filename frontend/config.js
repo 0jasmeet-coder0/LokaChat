@@ -9,7 +9,7 @@
                       host the API elsewhere (then use the full URL, no trailing slash).
    ===================================================================== */
 window.LOKA_CONFIG = {
-  SUPABASE_URL: "https://cfzucdlkalhmirorhvyi.supabase.co/rest/v1/",
+  SUPABASE_URL: "https://cfzucdlkalhmirorhvyi.supabase.co",
   SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNmenVjZGxrYWxobWlyb3JodnlpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ2NzEwMDYsImV4cCI6MjExMDI0NzAwNn0.8z2jZWkhVT4oJBbHVmnjw3tG8vwwfpUFD-ih_qLFEq4",
   API_URL: "/api",
 };
