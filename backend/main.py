@@ -1,4 +1,7 @@
-"""LokaChat API (FastAPI) - deploy on Koyeb.
+"""LokaChat API (FastAPI) - deployed on Vercel together with the frontend (see ../vercel.json).
+Vercel's Python runtime serves the module-level ASGI object `app`. Requests arrive as /api/...;
+the StripApiPrefix middleware below removes the /api prefix, so every route also still works
+without it (local `uvicorn main:app`, tests, Docker).
 
 Auth, OTP/2FA, follows, posts, chats. Media upload and realtime delivery go
 straight from the browser to Supabase Storage / Realtime using the session JWT
@@ -6,7 +9,9 @@ issued here (it is signed with the Supabase JWT secret so RLS applies).
 Run locally:  uvicorn main:app --reload
 """
 import logging
+import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
@@ -14,7 +19,10 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Req
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-import auth_2fa as auth
+# Make sibling modules (config, database, models, auth_2fa) importable however the runtime sets cwd.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import auth_2fa as auth  # noqa: E402
 from config import settings
 from database import first, public_url, remove_files, rows, table
 from models import (
@@ -26,6 +34,27 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("lokachat")
 
 app = FastAPI(title="LokaChat API", version="3.0.0")
+
+
+class StripApiPrefix:
+    """ASGI middleware: /api/auth/login -> /auth/login (Vercel routes /api/* to this app)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path == "/api" or path.startswith("/api/"):
+                scope = dict(scope)
+                scope["path"] = path[4:] or "/"
+                raw = scope.get("raw_path")
+                if raw and raw.startswith(b"/api"):
+                    scope["raw_path"] = raw[4:] or b"/"
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(StripApiPrefix)
 app.add_middleware(
     CORSMiddleware, allow_origins=settings.ALLOWED_ORIGINS, allow_credentials=False,
     allow_methods=["*"], allow_headers=["*"],
@@ -114,7 +143,14 @@ def session_for(user: dict) -> dict:
 def send_otp_to(user: dict, purpose: str, bg: BackgroundTasks) -> dict:
     code = auth.issue_otp(user["id"], purpose)
     contact = user.get("email") or user.get("phone")
-    bg.add_task(auth.deliver_otp, contact, code, purpose)
+    if os.environ.get("VERCEL"):
+        # Serverless: work after the response may be frozen, so deliver before responding.
+        try:
+            auth.deliver_otp(contact, code, purpose)
+        except Exception:  # never fail sign-in flow on a mail hiccup; user can resend
+            log.exception("OTP delivery failed")
+    else:
+        bg.add_task(auth.deliver_otp, contact, code, purpose)
     out = {"destination": auth.mask_contact(contact), "channel": auth.delivery_channel(contact),
            "expires_in": settings.OTP_TTL_MINUTES * 60}
     if settings.OTP_DEV_MODE:

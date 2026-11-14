@@ -1,0 +1,12 @@
+# Python dependencies for the FastAPI backend - installed automatically by Vercel (root of repo).
+# (uvicorn is not needed on Vercel; for local dev use: pip install uvicorn[standard])
+fastapi
+supabase
+pyotp
+passlib[bcrypt]
+bcrypt==4.0.1            # passlib 1.7.x is incompatible with bcrypt >= 5
+python-jose[cryptography]
+cryptography
+python-multipart
+pydantic
+httpx

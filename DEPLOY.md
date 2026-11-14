@@ -1,4 +1,19 @@
-# Deploying LokaChat (Supabase + Koyeb + Vercel)
+# Deploying LokaChat (Supabase + one Vercel project)
+
+**Current setup:** frontend AND the FastAPI backend deploy together in a single Vercel project (`vercel.json`).
+The API lives at `/api/*` on the same domain, so `frontend/config.js` uses `API_URL: "/api"` (no CORS).
+Skip section 2 (Koyeb) below - it is only kept as an alternative; the `Dockerfile` is not used by Vercel.
+
+## Vercel (frontend + API) - do this after step 1
+1. Push the repo (repo root = `D:\LokaChat`, containing `vercel.json`, `requirements.txt`, `frontend/`, `backend/`) to GitHub.
+2. Vercel -> New Project -> import it. **Root Directory: leave as the repo root.** Framework: Other. No build/output settings.
+3. **Settings -> Environment Variables** (Production): `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_JWT_SECRET`,
+   `OTP_DEV_MODE` (`true` for first test only), and for real email `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`.
+4. Put your Supabase URL and anon key in `frontend/config.js` (leave `API_URL: "/api"`), commit, deploy.
+5. Check `https://<your-project>.vercel.app/api/health` returns `{"status":"ok"...}`.
+
+Serverless notes: first request after idle is slower; the in-memory rate limiter is per instance (weaker than on a long-running server);
+Hobby plan functions time out at ~10 s. Local dev still works: `cd backend && uvicorn main:app --reload` (routes work with or without `/api`).
 
 ## 1. Supabase
 1. Create a project at supabase.com.
