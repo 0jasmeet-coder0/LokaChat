@@ -109,7 +109,7 @@
     S.identity = rec;
     return rec;
   }
-  /** Returns "ok" | "need-password" | "no-keys". `pw` is the password just typed at sign-in (or null on a restored session). */
+  /** Silent key sync. Returns "ok" | "need-password" | "no-keys" (never prompts; callers just fall back). `pw` is the password just typed at sign-in (or null on a restored session). */
   async function syncIdentity(user, pw) {
     try {
       const local = await C.loadIdentity(user.id), sp = serverPub(user);
@@ -143,37 +143,6 @@
   }
   App.syncIdentity = syncIdentity;
 
-  /** Modal asking for the account password to restore (or create) this device's encryption key. */
-  App.promptRestoreKeys = () => {
-    const hasBackup = !!S.user.key_backup;
-    App.modal(`<h3>${hasBackup ? "Restore your encryption keys" : "Set up encryption"}</h3>
-      <p class="muted small">${hasBackup ? "Enter your LokaChat password to unlock your encrypted chats on this device. Your key is stored encrypted with your password; the server can't read it." : "Enter your password to create encryption keys for this device. They are backed up encrypted with your password."}</p>
-      <form data-form="restore-keys"><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div>
-      <div class="modal-actions"><button class="btn" type="button" data-action="close-modal">Not now</button><button class="btn primary" type="submit">${hasBackup ? "Restore" : "Continue"}</button></div></form>`);
-  };
-  App.actions["restore-keys"] = () => App.promptRestoreKeys();
-  App.forms["restore-keys"] = async (form, data) => {
-    if (S.user.key_backup) {
-      let jwk;
-      try { jwk = await C.restoreIdentity(S.user.key_backup, data.password); } catch (e) { throw new Error("That password doesn't unlock your key backup"); }
-      S.identity = await C.storeIdentity(S.user.id, jwk, true);
-      const pub = JSON.stringify(S.identity.publicJwk);
-      if (!serverPub(S.user) || !C.samePub(serverPub(S.user), S.identity.publicJwk)) { await api.put("/users/me/key", { public_key: pub }); S.user.public_key = pub; }
-    } else await saveKeysToServer(await C.generateIdentityJwk(), data.password);
-    App.closeAllModals(); toast("Encryption keys ready");
-    if (App.refreshChats) await App.refreshChats();
-  };
-  App.actions["reset-keys"] = async () => {
-    if (!(await App.confirm("Create new encryption keys?", "Chats created with your old keys can't be opened afterwards. New chats work normally on every device.", "Create new keys", true))) return;
-    App.modal(`<h3>Confirm with your password</h3><form data-form="reset-keys"><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div>
-      <div class="modal-actions"><button class="btn danger" type="submit">Create new keys</button></div></form>`, { cls: "stack2" });
-  };
-  App.forms["reset-keys"] = async (form, data) => {
-    await saveKeysToServer(await C.generateIdentityJwk(), data.password);
-    form.closest(".modal-back").remove(); toast("New encryption keys created and backed up");
-    if (App.refreshChats) await App.refreshChats();
-  };
-
   async function enterApp(user, pw) {
     S.user = user;
     show("#app");
@@ -195,8 +164,8 @@
     App.prefetchHome(); if (App.prefetchReels) App.prefetchReels();
     App.loadChats().catch(() => {}); App.loadNotes().catch(() => {});
     App.startNotifPolling();
-    if (state === "need-password") App.promptRestoreKeys();
-    else if (state === "no-keys") toast("Encryption isn't available in this browser mode: " + (App.keyError || "storage blocked"), "err");
+    // keys are handled silently: if this device has none, chats use the fallback conversation key (see chat.js)
+    if (state !== "ok" && window.console) console.info("LokaChat: no device key (" + state + (App.keyError ? ": " + App.keyError : "") + ") - using fallback conversation keys");
   }
 
   function logout(message) {
@@ -238,6 +207,7 @@
     if (!cfg.SUPABASE_URL) missing.push("SUPABASE_URL");
     if (!cfg.SUPABASE_ANON_KEY) missing.push("SUPABASE_ANON_KEY");
     if (!cfg.API_URL) missing.push("API_URL");
+    else if (api.isNative && api.isNative() && !api.apiRoot()) missing.push("MOBILE_API_URL (full https://YOUR-APP.vercel.app/api URL, needed inside the mobile app)");
     if (!window.supabase) missing.push("Supabase SDK failed to load (check your internet connection)");
 
     if (missing.length) next = "setup";
@@ -256,6 +226,16 @@
     } else if (next === "app") await enterApp(user, null);
     else { show("#auth"); renderAuth(); if (err) toast(err, "err"); }
   }
+
+  // PWA: register the service worker (skipped inside the Capacitor app and on non-https/localhost dev)
+  function registerSW() {
+    try {
+      if (!("serviceWorker" in navigator) || (api.isNative && api.isNative())) return;
+      if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") return;
+      window.addEventListener("load", () => navigator.serviceWorker.register("service-worker.js").catch(() => {}));
+    } catch (e) { /* ignore */ }
+  }
+  registerSW();
 
   window.addEventListener("DOMContentLoaded", boot);
 })();

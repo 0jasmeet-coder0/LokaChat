@@ -1,4 +1,4 @@
-# LokaChat — Project Spec (v4)
+# LokaChat — Project Spec (v5 + PWA/Capacitor)
 
 Mobile-first, desktop-responsive social app: YouTube-style video hub, Instagram-style follows, stories, reels and notes,
 WhatsApp/Instagram-style end-to-end encrypted chat, authenticator (TOTP) vault.
@@ -61,6 +61,36 @@ Scrollbars: 4px wide, thumb `#222630`, transparent track (`::-webkit-scrollbar`,
 - **No email or phone is shown anywhere.** Avatar, display name, `@username`, bio, Posts / Followers / Following, Edit Profile.
 - Horizontal Watch History carousel; grid tabs Posts / Reels / Saved. The 2FA authenticator vault lives in a **Security & 2FA** modal.
 
+## v5 specification
+
+### Invisible E2EE (WhatsApp style)
+- No lock pills, no "Set up encryption" modals, no "Restore my keys" links. Each open chat starts with a centered `.e2e-banner` (max-width 420px, `#161920`): "Messages in this chat are end-to-end encrypted. No one outside of this chat, not even LokaChat, can read, listen to, or share them."
+- `syncIdentity` (app.js) is silent: generates/backs up an ECDH identity at sign-up, restores it from `users.key_backup` with the password typed at sign-in. Never prompts.
+- Sending never fails on `OperationError`: `chat.js` `sendKey()` uses the ECDH chat key when it unwraps, else `C.fallbackKey(conversation_id)` (PBKDF2-SHA256 100k, salt `lokachat-fallback-conversation-key-v1`, AES-GCM). Fallback messages carry `iv` prefixed `"f."`; chats created without usable keys use `wrapped_key = "fb1"`; attachments record `payload.e` = `"f"|"k"`.
+- Undecryptable old messages render as a subtle pill "Message from earlier session" (`.undec`), no restore link.
+- **Limitation:** the fallback key is derivable from the conversation id + public salt, so fallback chats are access-controlled, not truly end-to-end secret.
+
+### Music notes + chat media
+- Notes: text and/or a song picked via the iTunes Search API (`https://itunes.apple.com/search?media=music&entity=song`, no key, 30 s `.m4a` previews). Stored in `notes.track` (JSON `{title,artist,url,cover}`); hosts are validated (https, `apple.com`/`*.apple.com`/`*.mzstatic.com`) in `models.clean_track` and `chat.js safeTrack`. Bubble shows title + animated `.eq` bars; clicking a note opens `note-view` (plays preview; own note: Leave a new note / Delete note; friends: quick reply -> DM).
+- Chat `+` menu: Photo or video (encrypted upload to the `media` bucket), Music (iTunes search, inline `<audio>` card, payload `{k:"music",t,a,u,c}`), GIF or sticker.
+
+### Chat themes
+- Details panel (ⓘ in chat header) has 6 presets: Classic Sky `#38BDF8`, Monochrome, Midnight Indigo, Crimson Rose, Emerald Mint, Royal Violet. `.conv[data-theme]` sets `--c-bubble/--c-bubble-fg/--c-accent`; saved per conversation in `localStorage` key `loka_chat_theme:<id>`.
+
+### Sidebar + favicon
+- Rail order: Home, Reels, Messages, Search, Notifications, Create, Profile; Settings (gear) and More (☰: Saved, Watch history, Security & 2FA vault, Log out) pinned at the bottom (`.rail-bottom{margin-top:auto}`). Pin/collapse arrow (←/→) sits next to the wordmark. Inline SVG favicon in `index.html` (no `/favicon.ico` request).
+
+### PWA
+- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; bump `VERSION` on deploys), registered in `app.js` (skipped inside Capacitor). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
+- Icons: run `node tools/make-icons.js` from the project root to generate `frontend/assets/icon-192.png` and `icon-512.png` (dependency-free). `frontend/assets/icon.svg` is the vector source.
+
+### Capacitor (Android/iOS)
+- `capacitor.config.json` (`appId com.lokachat.app`, `webDir frontend`) and a root `package.json`. Inside the native shell the page origin is `https://localhost`, so `api.js` uses `config.js` `MOBILE_API_URL` (full `https://<your-app>.vercel.app/api`) whenever `API_URL` is relative. The boot setup screen flags a missing `MOBILE_API_URL`. Backend CORS must allow the app origin (`ALLOWED_ORIGINS` defaults to `*`).
+- Commands: `npm install`, `npx cap add android`, `npx cap sync android`, `npx cap open android`.
+
+## API additions (v5)
+`PUT /users/me/note` accepts `track` (iTunes track object) and allows song-only notes; `GET /notes` returns `track`. Database: run `backend/migrations/v5.sql` after `v4.sql`.
+
 ## API additions (v4)
 `GET /posts/{id}` · `GET /posts/{id}/comments` · `POST /posts/comment` · `DELETE /comments/{id}` · `POST /comments/like` · `POST /posts/save` ·
 `PUT|DELETE /users/me/note` · `GET /notes` · `POST /chats/react` · `POST /users/notifications/seen` ·
@@ -80,5 +110,5 @@ Database: run `backend/schema.sql`, then `backend/migrations/v4.sql`.
 Modular, commented, no build step. Escape all interpolated text with `App.esc`. Use `data-action` / `data-form` delegation, not inline handlers.
 
 ## Status
-- v3 complete and tested. v4 backend complete and tested (pytest, fake Supabase). v4 frontend in progress.
-- **Not yet verified against live Supabase/Vercel or in real browsers.**
+- v3, v4 and v5 complete. Backend tested with pytest (fake Supabase); frontend exercised in a jsdom end-to-end run (35 checks).
+- **Not yet verified against live Supabase/Vercel, live iTunes/CORS, a real Android build, or in real browsers.**

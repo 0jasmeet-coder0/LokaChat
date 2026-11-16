@@ -4,7 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LokaChat">
+<meta name="description" content="LokaChat - videos, reels, stories and private chat.">
 <title>LokaChat</title>
+<!-- Favicon: inline sky-blue/white droplet-chat icon (no /favicon.ico request, so no 404) -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23000'/%3E%3Cpath d='M32 7C32 7 14 28 14 40a18 18 0 0 0 36 0C50 28 32 7 32 7z' fill='%2338BDF8'/%3E%3Cpath d='M23 38h18M23 45h11' stroke='%23fff' stroke-width='3.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="assets/icon-192.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -50,6 +60,12 @@
     <symbol id="i-full" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
     <symbol id="i-thumbdown" viewBox="0 0 24 24"><path d="M17 14V3H7l-3 8v3h6l-1 6 7-8zM17 3h4v10h-4"/></symbol>
     <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+    <symbol id="i-add" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></symbol>
+    <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></symbol>
+    <symbol id="i-arrow-left" viewBox="0 0 24 24"><path d="M20 12H5M11 6l-6 6 6 6"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
     <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4"/></symbol>
   </defs>
 </svg>
@@ -88,8 +104,8 @@
 <div id="app" hidden>
   <header id="topbar">
     <div class="tb-left">
-      <button class="icon-btn" id="rail-toggle" data-action="toggle-pin" aria-label="Toggle sidebar"></button>
       <a class="wordmark" href="#/home" aria-label="LokaChat home"><span class="w1">Loka</span><span class="w2">Chat</span></a>
+      <button class="icon-btn" id="rail-toggle" data-action="toggle-pin" aria-label="Pin or collapse sidebar"></button>
     </div>
     <div class="tb-right">
       <div class="menu-root" data-menu-root>
@@ -113,11 +129,22 @@
       <a class="rail-item" data-route="reels" href="#/reels"><svg class="ic"><use href="#i-clips"/></svg><span class="lbl">Reels</span></a>
       <a class="rail-item" data-route="messages" href="#/messages"><svg class="ic"><use href="#i-send"/></svg><span class="lbl">Messages</span><b class="badge" id="badge-msg" hidden></b></a>
       <a class="rail-item" data-route="search" href="#/search"><svg class="ic"><use href="#i-search"/></svg><span class="lbl">Search</span></a>
+      <button class="rail-item" data-action="open-notifs"><svg class="ic"><use href="#i-heart"/></svg><span class="lbl">Notifications</span><b class="badge" id="notif-dot-r" hidden></b></button>
       <a class="rail-item" data-route="post" href="#/post"><svg class="ic"><use href="#i-plus"/></svg><span class="lbl">Create</span></a>
-      <a class="rail-item" data-route="you" href="#/you"><span class="rail-avatar" id="rail-avatar"></span><span class="lbl">You</span></a>
+      <a class="rail-item" data-route="you" href="#/you"><span class="rail-avatar" id="rail-avatar"></span><span class="lbl">Profile</span></a>
+      <div class="rail-bottom" data-menu-root>
+        <button class="rail-item" data-action="open-settings"><svg class="ic"><use href="#i-gear"/></svg><span class="lbl">Settings</span></button>
+        <button class="rail-item" data-action="toggle-menu" data-target="more-menu"><svg class="ic"><use href="#i-menu"/></svg><span class="lbl">More</span></button>
+      </div>
     </nav>
   </aside>
   <div class="rail-space"></div>
+  <div class="menu more-menu" id="more-menu" data-menu-root>
+    <button data-action="more-saved"><svg class="ic"><use href="#i-bookmark"/></svg>Saved</button>
+    <button data-action="more-history"><svg class="ic"><use href="#i-clock"/></svg>Watch history</button>
+    <button data-action="more-vault"><svg class="ic"><use href="#i-shield"/></svg>Security &amp; 2FA vault</button>
+    <button data-action="logout" class="danger-t"><svg class="ic"><use href="#i-logout"/></svg>Log out</button>
+  </div>
 
   <div id="main"><main id="view" tabindex="-1"></main></div>
 

@@ -1,0 +1,8 @@
+{
+  "appId": "com.lokachat.app",
+  "appName": "LokaChat",
+  "webDir": "frontend",
+  "server": {
+    "androidScheme": "https"
+  }
+}

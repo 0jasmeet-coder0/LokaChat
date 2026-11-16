@@ -3,7 +3,7 @@
    - E2EE identity: per-user ECDH P-256 key pair kept in IndexedDB (non-extractable) + a password-encrypted
      backup stored on the server (users.key_backup) so every device can restore the SAME key
    - Chat keys: random AES-256-GCM key, wrapped per member with ECDH + HKDF
-   - Message encryption: AES-256-GCM
+   - Message encryption: AES-256-GCM (ECDH chat key, or the deterministic fallback conversation key)
    - Local vault: PBKDF2 -> AES-GCM sealed JSON
    - TOTP (RFC 6238, HMAC-SHA1) + base32 + otpauth:// parsing
    ===================================================================== */
@@ -125,6 +125,22 @@
     return importChatKey(new Uint8Array(raw));
   }
 
+  // ---------- fallback conversation key ----------
+  // Used when a chat has no usable ECDH key (missing recipient key, new device, OperationError). Derived from the
+  // conversation id + a fixed app salt (PBKDF2-SHA256), so every participant can always read and send on any device.
+  // NOTE: anyone who knows the conversation id and this app salt can derive the key, so this mode protects
+  // messages only at the same level as access control - it is not end-to-end secret.
+  const fbCache = new Map();
+  async function fallbackKey(conversationId) {
+    const id = String(conversationId || "");
+    if (fbCache.has(id)) return fbCache.get(id);
+    const base = await subtle.importKey("raw", enc.encode(id.toLowerCase()), "PBKDF2", false, ["deriveKey"]);
+    const key = await subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt: enc.encode("lokachat-fallback-conversation-key-v1"), iterations: 100000 },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    fbCache.set(id, key);
+    return key;
+  }
+
   // ---------- message encryption ----------
   async function encryptText(key, text) {
     const iv = rand(12);
@@ -222,6 +238,6 @@
 
   window.LokaCrypto = {
     loadIdentity, storeIdentity, generateIdentityJwk, backupIdentity, restoreIdentity, clearIdentity, samePub, pubOf,
-    newChatKeyRaw, importChatKey, wrapChatKey, unwrapChatKey, encryptText, decryptText, encryptBytes, decryptBytes, vaultCreate, vaultOpen, sealJson, totp, parseOtpauth, base32ToBytes,
+    newChatKeyRaw, importChatKey, fallbackKey, wrapChatKey, unwrapChatKey, encryptText, decryptText, encryptBytes, decryptBytes, vaultCreate, vaultOpen, sealJson, totp, parseOtpauth, base32ToBytes,
   };
 })();

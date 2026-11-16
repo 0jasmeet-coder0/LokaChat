@@ -1,0 +1,16 @@
+{
+  "name": "lokachat",
+  "version": "5.0.0",
+  "private": true,
+  "description": "LokaChat - Capacitor wrapper (the web app lives in frontend/, no build step)",
+  "scripts": {
+    "sync": "npx cap sync",
+    "android": "npx cap sync android && npx cap open android",
+    "ios": "npx cap sync ios && npx cap open ios"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/cli": "^6.0.0",
+    "@capacitor/core": "^6.0.0"
+  }
+}

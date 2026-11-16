@@ -15,8 +15,12 @@
   let channel = null;
   let onUnauthorized = () => {};
 
-  const configured = () => !!(cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY && cfg.API_URL && window.supabase);
-  const base = () => cfg.API_URL.replace(/\/+$/, "");
+  const configured = () => !!(cfg.SUPABASE_URL && cfg.SUPABASE_ANON_KEY && apiRoot() && window.supabase);
+  // Inside a Capacitor app the page origin is https://localhost, so a relative "/api" would hit
+  // the app itself. There we use the absolute MOBILE_API_URL (your live Vercel URL + "/api").
+  const isNative = () => { try { return !!(window.Capacitor && (window.Capacitor.isNativePlatform ? window.Capacitor.isNativePlatform() : window.Capacitor.getPlatform && window.Capacitor.getPlatform() !== "web")); } catch (e) { return false; } };
+  const apiRoot = () => (isNative() && !/^https?:\/\//i.test(cfg.API_URL || "") ? (cfg.MOBILE_API_URL || "") : (cfg.API_URL || ""));
+  const base = () => apiRoot().replace(/\/+$/, "");
 
   class ApiError extends Error {
     constructor(message, status) { super(message); this.status = status; }
@@ -108,6 +112,8 @@
   window.LokaApi = {
     configured, ApiError, request, setToken, upload, removeFiles, publicUrl, subscribe, unsubscribe,
     hasToken: () => !!token,
+    apiRoot,
+    isNative,
     onUnauthorized: (fn) => { onUnauthorized = fn; },
     get: (p) => request("GET", p),
     post: (p, b, o) => request("POST", p, b === undefined ? {} : b, o),

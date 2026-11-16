@@ -3,6 +3,7 @@
 Built by a factory so it needs no import of main.py (avoids circular imports on any runtime):
 main.py calls `social.build_router(helpers)` once at the bottom of the file.
 """
+import json
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -103,13 +104,18 @@ def build_router(h):
 
     # ------------------------------------------------------------------ notes
     def note_shape(n: dict, u: dict) -> dict:
-        return {"user": h.pub(u), "text": n["text"], "music": n.get("music") or "", "created_at": n["created_at"]}
+        try:
+            track = json.loads(n.get("track") or "null")
+        except ValueError:
+            track = None
+        return {"user": h.pub(u), "text": n["text"], "music": n.get("music") or "", "track": track, "created_at": n["created_at"]}
 
     @r.put("/users/me/note")
     def set_note(body: NoteIn, user: dict = me):
         row = {"user_id": user["id"], "text": body.text.strip(), "music": body.music.strip(),
+               "track": json.dumps(body.track) if body.track else "",
                "created_at": h.iso(h.now()), "expires_at": h.iso(h.now() + timedelta(hours=24))}
-        if not row["text"]:
+        if not row["text"] and not body.track:
             raise HTTPException(422, "Note can't be empty")
         h.table("notes").upsert(row, on_conflict="user_id").execute()
         return note_shape(row, user)

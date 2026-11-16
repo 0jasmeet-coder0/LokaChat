@@ -160,6 +160,16 @@ class ChatCreate(BaseModel):
     my_wrapped_key: Optional[str] = Field(default=None, max_length=2000)
 
 
+class SendIn(BaseModel):
+    conversation_id: str
+    ciphertext: str = Field(min_length=1, max_length=12000)
+    iv: str = Field(default="", max_length=100)
+
+    @field_validator("conversation_id")
+    @classmethod
+    def _id(cls, v): return check_uuid(v)
+
+
 class CommentIn(BaseModel):
     post_id: str
     body: str = Field(min_length=1, max_length=500)
@@ -190,9 +200,38 @@ class SaveIn(BaseModel):
     def _id(cls, v): return check_uuid(v)
 
 
+def _safe_media_url(v) -> str:
+    """Only https URLs on Apple's preview/artwork hosts (iTunes Search API) are accepted for music tracks."""
+    from urllib.parse import urlparse
+    u = urlparse(str(v or ""))
+    host = (u.hostname or "").lower()
+    ok = u.scheme == "https" and (host == "apple.com" or host.endswith(".apple.com") or host.endswith(".mzstatic.com"))
+    if not ok or len(str(v)) > 400:
+        raise ValueError("Unsupported music link")
+    return str(v)
+
+
+def clean_track(t) -> Optional[dict]:
+    """Normalise a music track {title, artist, url, cover}; None when empty. Raises ValueError for bad links."""
+    if not t:
+        return None
+    if not isinstance(t, dict):
+        raise ValueError("Invalid track")
+    title, artist = str(t.get("title") or "").strip()[:80], str(t.get("artist") or "").strip()[:80]
+    if not title:
+        raise ValueError("Track needs a title")
+    cover = str(t.get("cover") or "")
+    return {"title": title, "artist": artist, "url": _safe_media_url(t.get("url")), "cover": _safe_media_url(cover) if cover else ""}
+
+
 class NoteIn(BaseModel):
-    text: str = Field(min_length=1, max_length=60)
+    text: str = Field(default="", max_length=60)
     music: str = Field(default="", max_length=60)
+    track: Optional[dict] = None   # {title, artist, url (30s preview), cover} from the iTunes Search API
+
+    @field_validator("track")
+    @classmethod
+    def _track(cls, v): return clean_track(v)
 
 
 class ReactIn(BaseModel):
@@ -200,15 +239,5 @@ class ReactIn(BaseModel):
     emoji: str = Field(default="", max_length=16)  # "" removes my reaction
 
     @field_validator("message_id")
-    @classmethod
-    def _id(cls, v): return check_uuid(v)
-
-
-class SendIn(BaseModel):
-    conversation_id: str
-    ciphertext: str = Field(min_length=1, max_length=12000)
-    iv: str = Field(default="", max_length=100)
-
-    @field_validator("conversation_id")
     @classmethod
     def _id(cls, v): return check_uuid(v)

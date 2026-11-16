@@ -2,7 +2,7 @@
    LokaChat - you.js   (v4)  Privacy-first Instagram + YouTube profile
    Avatar, name, @username, bio, counts (NO email/phone anywhere), Edit profile,
    Watch History carousel, Posts / Reels / Saved grids, and a "Security & 2FA"
-   modal (account 2FA, local authenticator vault, encryption keys). Log out.
+   modal (account 2FA, local authenticator vault). Log out.
    ===================================================================== */
 (function () {
   "use strict";
@@ -33,6 +33,7 @@
       api.get("/auth/me").then((u) => { if (!S.user) return; S.user = { ...S.user, ...u }; if (!ctx.stale()) paintHead(); }).catch(() => {});
       App.swr("history", async () => (await api.get("/history")).items, () => paintHistory(), { fresh: 30000 }).catch(() => {});
       loadGrid(false);
+      if (S.scrollTo) { const t = $(S.scrollTo === "hist" ? "#you-hist" : "#you-tabs"); S.scrollTo = null; if (t) t.scrollIntoView({ block: "start" }); else window.scrollTo(0, 0); }
     },
   };
   App.refreshYou = () => { if (S.route === "you") { paintHead(); paintHistory(); loadGrid(true); } };
@@ -69,6 +70,19 @@
   App.actions["you-tab"] = (el) => { S.youTab = el.dataset.tab; paintGrid(); };
 
   // ============================================================ profile editing
+  // ---------- sidebar: Settings + More ----------
+  App.actions["open-settings"] = () => {
+    App.closeMenus();
+    modal(`<h3>Settings</h3><div class="stack">
+      <button class="btn block" data-action="edit-profile">${icon("edit")}Edit profile</button>
+      <button class="btn block" data-action="open-security">${icon("shield")}Security & 2FA</button>
+      <button class="btn block" data-action="toggle-pin">${icon("arrow-left")}Pin / collapse sidebar</button></div>`, {});
+  };
+  const goYou = (scroll, tab) => { App.closeMenus(); if (tab) S.youTab = tab; S.scrollTo = scroll; if (S.route === "you") { if (tab) paintGrid(); const t = $(scroll === "hist" ? "#you-hist" : "#you-tabs"); S.scrollTo = null; if (t) t.scrollIntoView({ block: "start" }); } else location.hash = "#/you"; };
+  App.actions["more-saved"] = () => goYou("tabs", "saved");
+  App.actions["more-history"] = () => goYou("hist");
+  App.actions["more-vault"] = () => { App.closeMenus(); App.openSecurity("vault"); };
+
   App.actions["edit-profile"] = () => {
     const u = S.user;
     modal(`<h3>Edit profile</h3><form data-form="edit-profile">
@@ -101,7 +115,7 @@
 
   App.actions["open-security"] = (el, ev, tab) => {
     secTab = tab || "2fa";
-    modal(`<h3>Security & 2FA</h3><div class="tabs hscroll" id="sec-tabs">${[["2fa", "Two-factor"], ["vault", "Authenticator vault"], ["keys", "Encryption keys"]].map(([k, l]) => `<button data-action="sec-tab" data-tab="${k}">${l}</button>`).join("")}</div>
+    modal(`<h3>Security & 2FA</h3><div class="tabs hscroll" id="sec-tabs">${[["2fa", "Two-factor"], ["vault", "Authenticator vault"]].map(([k, l]) => `<button data-action="sec-tab" data-tab="${k}">${l}</button>`).join("")}</div>
       <div id="sec-body"></div>`, { cls: "wide", noFocus: true, onClose: () => clearInterval(vaultTimer) });
     renderSec();
   };
@@ -110,7 +124,7 @@
   function renderSec() {
     $$("#sec-tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === secTab));
     const body = $("#sec-body"); if (!body) return;
-    if (secTab === "2fa") renderTwoFactor(body); else if (secTab === "vault") renderVault(body); else renderKeys(body);
+    if (secTab === "2fa") renderTwoFactor(body); else renderVault(body);
   }
 
   // ---------- account 2FA (server-backed) ----------
@@ -158,19 +172,6 @@
     await addEntry(C.parseOtpauth(el.dataset.uri), "LokaChat " + S.user.username);
     toast("Added to your vault");
   };
-
-  // ---------- encryption keys ----------
-  function renderKeys(body) {
-    const has = !!S.identity, backed = !!S.user.key_backup;
-    body.innerHTML = `<div class="card section"><div class="row"><span class="acc">${icon("lock")}</span><h3 style="margin:0">End-to-end encryption</h3></div>
-      <p class="muted">Messages are encrypted in your browser; the server only stores ciphertext. Your private key is backed up <b>encrypted with your password</b>, so signing in on a new device restores the same key and every chat stays readable.</p>
-      <ul class="keystat"><li><b>This device:</b> ${has ? '<span class="acc">has your key</span>' : '<span class="danger-t">no key yet</span>'}</li>
-      <li><b>Password-protected backup:</b> ${backed ? '<span class="acc">saved</span>' : '<span class="danger-t">not saved</span>'}</li></ul>
-      <div class="row wrap">${!has && backed ? `<button class="btn primary" data-action="restore-keys">Restore my keys</button>` : ""}
-      <button class="btn ${has ? "" : "primary"}" data-action="reset-keys">${backed ? "Create new keys" : has ? "Create backup (new keys)" : "Set up keys"}</button></div>
-      <p class="muted small" style="margin-top:10px">Creating new keys replaces the old ones: chats created before can't be opened afterwards.</p></div>
-      <div class="card section"><div class="row"><h3 class="grow" style="margin:0">Session</h3><button class="btn danger" data-action="logout">${icon("logout")}Log out</button></div></div>`;
-  }
 
   // ---------- local authenticator vault ----------
   function renderVault(body) {

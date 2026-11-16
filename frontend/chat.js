@@ -5,8 +5,10 @@
      attachments (encrypted in the browser, stored as opaque blobs), replies,
      heart reactions (double-tap), optimistic sending with retry
    - The floating bottom-right Messages pill + quick-chat popover (desktop)
-   E2EE: each chat has an AES-256-GCM key, wrapped per member with ECDH+HKDF.
-   Decrypted message text is JSON: {v:1,k:"text|gif|image|video|audio|voice",...}
+   Encryption is invisible (WhatsApp style): each chat has an AES-256-GCM key wrapped per member with ECDH+HKDF.
+   If that key is unavailable (no recipient key, new device, OperationError) the chat silently uses a deterministic
+   fallback conversation key (iv marked "f.") so sending never fails and both people can always read.
+   Decrypted message text is JSON: {v:1,k:"text|gif|image|video|audio|voice|music",...}
    ===================================================================== */
 (function () {
   "use strict";
@@ -37,26 +39,35 @@
     if (typeof text === "string" && text.charAt(0) === "{") { const o = safeJson(text); if (o && o.v === 1 && o.k) return o; }
     return { k: "text", t: text };
   };
-  const previewOf = (pl) => ({ text: pl.t, gif: "GIF", sticker: "Sticker", image: "📷 Photo", video: "🎥 Video", audio: "🎵 Music clip", voice: "🎤 Voice message" }[pl.k] || pl.t || "");
+  const previewOf = (pl) => ({ text: pl.t, music: "🎵 " + (pl.t || "Music"), gif: "GIF", sticker: "Sticker", image: "📷 Photo", video: "🎥 Video", audio: "🎵 Music clip", voice: "🎤 Voice message" }[pl.k] || pl.t || "");
 
   // ---------- keys + decoding ----------
-  async function chatKey(chat) {
-    if (chat.type === "channel") return null;
+  /** The ECDH chat key, or null when this chat uses the fallback key / the key can't be unwrapped on this device. */
+  async function e2eKey(chat) {
+    if (chat.type === "channel" || !chat.wrapped_key || chat.wrapped_key === "fb1") return null;
     if (keyCache.has(chat.id)) return keyCache.get(chat.id);
-    if (!S.identity) throw new Error("Encryption keys aren't set up on this device");
-    if (!chat.wrapped_key) throw new Error("This chat has no key for you");
-    const fallback = chat.wrapped_by && safeJson(chat.wrapped_by.public_key);
-    const key = await C.unwrapChatKey(chat.wrapped_key, S.identity.privateKey, fallback);
-    keyCache.set(chat.id, key);
-    return key;
+    if (!S.identity) return null;
+    try {
+      const fallback = chat.wrapped_by && safeJson(chat.wrapped_by.public_key);
+      const key = await C.unwrapChatKey(chat.wrapped_key, S.identity.privateKey, fallback);
+      keyCache.set(chat.id, key);
+      return key;
+    } catch (e) { return null; }   // OperationError etc: never surfaced, we fall back instead
   }
+  const fbKey = (chat) => C.fallbackKey(chat.id);
+  const isFb = (iv) => typeof iv === "string" && iv.charAt(0) === "f" && iv.charAt(1) === ".";
+  /** Key used to SEND in this chat: the ECDH key when it works, else the fallback key. */
+  async function sendKey(chat) { const k = await e2eKey(chat); return k ? { key: k, fb: false } : { key: await fbKey(chat), fb: true }; }
   async function decode(chat, m) {
     const base = { ...m, failed: false, reactions: m.reactions || [] };
     if (!m.encrypted) return { ...base, payload: { k: "text", t: m.ciphertext } };
-    try { return { ...base, payload: parsePayload(await C.decryptText(await chatKey(chat), m.ciphertext, m.iv)) }; }
-    catch (e) { return { ...base, payload: { k: "text", t: "" }, failed: true, why: App.errText(e) }; }
+    try {
+      const fb = isFb(m.iv), key = fb ? await fbKey(chat) : await e2eKey(chat);
+      if (!key) throw new Error("No key for this message");
+      return { ...base, payload: parsePayload(await C.decryptText(key, m.ciphertext, fb ? m.iv.slice(2) : m.iv)) };
+    } catch (e) { return { ...base, payload: { k: "text", t: "" }, failed: true }; }
   }
-  const previewMsg = (chat, m) => (m.sender_id === S.user.id ? "You: " : "") + (m.failed ? "🔒 Encrypted message" : previewOf(m.payload));
+  const previewMsg = (chat, m) => (m.sender_id === S.user.id ? "You: " : "") + (m.failed ? "Message from earlier session" : previewOf(m.payload));
 
   // ---------- data (stale-while-revalidate) ----------
   async function computePreviews(chats) {
@@ -127,33 +138,154 @@
       const ga = groupOf(a.id), gb = groupOf(b.id);
       return (gb ? !App.groupSeen(gb) : 0) - (ga ? !App.groupSeen(ga) : 0);
     });
+    const eq = '<span class="eq"><i></i><i></i><i></i></span>';
     const item = (u, me) => {
       const n = noteOf(u.id), g = groupOf(u.id);
-      const bubble = n ? `<span class="note-bubble" ${me ? "" : `data-action="dm" data-user="${esc(u.username)}"`}>${esc(n.text)}${n.music ? `<i>♪ ${esc(n.music)}</i>` : ""}</span>` : me ? `<span class="note-bubble empty">Note...</span>` : "";
-      return `<div class="nt-item" data-action="${me ? "note-menu" : g ? "open-story" : "dm"}" data-id="${esc(u.id)}" data-user="${esc(u.username)}">${bubble}
+      const trk = n && safeTrack(n.track);
+      const bubble = n ? `<span class="note-bubble" data-action="note-view" data-id="${esc(u.id)}">${n.text ? `<span class="nb-t">${esc(n.text)}</span>` : ""}${trk ? `<i class="nb-trk">${eq}${esc(trk.title)}</i>` : n.music ? `<i class="nb-trk">♪ ${esc(n.music)}</i>` : ""}</span>` : me ? `<span class="note-bubble empty" data-action="note-menu">Note...</span>` : "";
+      return `<div class="nt-item" data-action="${me ? "note-menu" : g ? "open-story" : n ? "note-view" : "dm"}" data-id="${esc(u.id)}" data-user="${esc(u.username)}">${bubble}
         ${avatar(u, "l", g ? (App.groupSeen(g) ? "seen" : "new") : null, g ? u.id : null)}<span class="nm ellipsis">${me ? "Your note" : esc(u.display_name)}</span></div>`;
     };
     row.innerHTML = item(S.user, true) + sorted.map((u) => item(u, false)).join("");
   }
+  // ---------- music (iTunes Search API: free, no key, 30 s .m4a previews) ----------
+  const okHost = (u) => { try { const x = new URL(u); const h = x.hostname.toLowerCase(); return x.protocol === "https:" && (h === "apple.com" || h.endsWith(".apple.com") || h.endsWith(".mzstatic.com")); } catch (e) { return false; } };
+  /** Validates a track coming from the network (notes, messages): only https Apple preview/artwork hosts are playable. */
+  const safeTrack = (t) => (t && t.title && okHost(t.url) ? { title: String(t.title).slice(0, 80), artist: String(t.artist || "").slice(0, 80), url: t.url, cover: t.cover && okHost(t.cover) ? t.cover : "" } : null);
+  App.safeTrack = safeTrack;
+  async function itunesSearch(q) {
+    const res = await fetch("https://itunes.apple.com/search?media=music&entity=song&limit=12&term=" + encodeURIComponent(q));
+    if (!res.ok) throw new Error("Music search failed (" + res.status + ")");
+    const { results } = await res.json();
+    return (results || []).filter((r) => r.previewUrl).map((r) => safeTrack({ title: r.trackName, artist: r.artistName, url: r.previewUrl, cover: (r.artworkUrl100 || "").replace("100x100", "200x200") })).filter(Boolean);
+  }
+  App.itunesSearch = itunesSearch;
+  const eqHtml = '<span class="eq"><i></i><i></i><i></i></span>';
+  const coverHtml = (t) => (t.cover ? `<img class="trk-cover" src="${esc(t.cover)}" alt="" loading="lazy">` : `<span class="trk-cover ph">${icon("music")}</span>`);
+  function musicCard(pl) {
+    const t = safeTrack({ title: pl.t, artist: pl.a, url: pl.u, cover: pl.c });
+    if (!t) return `<span class="txt">🎵 ${esc(pl.t || "Music")}</span>`;
+    return `<div class="mus-card">${coverHtml(t)}<div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><div class="muted small ellipsis">${esc(t.artist)}</div><audio controls preload="none" src="${esc(t.url)}"></audio></div></div>`;
+  }
+
+  let previewAudio = null, previewIdx = -1;
+  const stopPreview = () => { if (previewAudio) { try { previewAudio.pause(); } catch (e) { /* ignore */ } previewAudio = null; } previewIdx = -1; $$(".trk-row.playing").forEach((r) => r.classList.remove("playing")); };
+  /** Search box + results. onPick(track) is called when a result's action button is pressed. */
+  function wireTrackSearch(root, actionLabel, onPick) {
+    const input = $(".trk-q", root), list = $(".trk-list", root);
+    let results = [], seq = 0;
+    const paint = () => {
+      list.innerHTML = results.length ? results.map((t, i) => `<div class="trk-row" data-i="${i}">${coverHtml(t)}<div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><div class="muted small ellipsis">${esc(t.artist)}</div></div>
+        <button type="button" class="btn sm" data-trk="play" aria-label="Preview">${icon("play")}</button><button type="button" class="btn sm primary" data-trk="pick">${esc(actionLabel)}</button></div>`).join("") : '<p class="muted small center" style="padding:14px 0">No songs found.</p>';
+    };
+    input.addEventListener("input", App.debounce(async () => {
+      const q = input.value.trim(), my = ++seq;
+      if (q.length < 2) { list.innerHTML = '<p class="muted small">Search for a song to add a 30-second preview.</p>'; return; }
+      list.innerHTML = '<div class="spinner"></div>';
+      try { const r = await itunesSearch(q); if (my !== seq) return; results = r; paint(); }
+      catch (e) { if (my === seq) list.innerHTML = `<p class="muted small center" style="padding:14px 0">${esc(App.errText(e))}</p>`; }
+    }, 350));
+    list.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-trk]"), row = e.target.closest(".trk-row");
+      if (!b || !row) return;
+      const i = Number(row.dataset.i), t = results[i];
+      if (!t) return;
+      if (b.dataset.trk === "play") {
+        const was = previewIdx === i && previewAudio; stopPreview();
+        if (was) return;
+        previewAudio = new Audio(t.url); previewIdx = i; row.classList.add("playing");
+        previewAudio.addEventListener("ended", stopPreview);
+        previewAudio.play().catch(() => { toast("Couldn't play this preview", "err"); stopPreview(); });
+      } else { stopPreview(); onPick(t); }
+    });
+  }
+  const trackSearchHtml = () => `<div class="trk-search"><input class="trk-q" type="search" placeholder="Search songs or artists" autocomplete="off"><div class="trk-list"><p class="muted small">Search for a song to add a 30-second preview.</p></div></div>`;
+
+  // send a song in a chat
+  App.actions["pick-music"] = () => {
+    closeAttMenu();
+    const chat = find(openId); if (!chat) return;
+    const m = modal(`<h3>Send music</h3>${trackSearchHtml()}`, { cls: "wide", onClose: stopPreview });
+    wireTrackSearch(m.el, "Send", (t) => { m.close(); sendPayload(chat, { k: "music", t: t.title, a: t.artist, u: t.url, c: t.cover, ...(replyTo ? { r: replyTo } : {}) }); clearReply(); });
+  };
+
+  // ---------- notes (text + optional song) ----------
+  let noteTrack = null;
+  const noteOf = (id) => (App.cacheGet("notes") || []).find((n) => n.user.id === id);
+  const trackChip = () => (noteTrack ? `<div class="trk-chip">${coverHtml(noteTrack)}<div class="grow"><b class="ellipsis" style="display:block">${esc(noteTrack.title)}</b><span class="muted small">${esc(noteTrack.artist)}</span></div>${eqHtml}<button type="button" class="icon-btn" data-action="note-track-clear" aria-label="Remove song">${icon("close")}</button></div>` : "");
+  App.actions["note-track-clear"] = () => { noteTrack = null; const c = $("#note-track"); if (c) c.innerHTML = ""; };
   App.actions["note-menu"] = () => {
-    const mine = (App.cacheGet("notes") || []).find((n) => n.user.id === S.user.id);
-    const hasStory = (App.cacheGet("stories") || []).some((g) => g.author.id === S.user.id);
-    modal(`<h3>Your note</h3><form data-form="note">
-      <div class="field"><label>Share a thought (24h, ${60} characters)</label><input name="text" maxlength="60" required value="${esc(mine ? mine.text : "")}" placeholder="What's on your mind?"></div>
-      <div class="field"><label>Song or music tag (optional)</label><input name="music" maxlength="60" value="${esc(mine ? mine.music : "")}" placeholder="e.g. Artist - Song"></div>
-      <div class="modal-actions">${mine ? `<button class="btn danger" type="button" data-action="note-del">Delete</button>` : ""}<button class="btn primary" type="submit">Share</button></div></form>
-      <div class="note-alt"><button class="btn block" data-action="add-story">Add to your story</button>${hasStory ? `<button class="btn block" data-action="open-story" data-id="${esc(S.user.id)}">View your story</button>` : ""}</div>`);
+    const mine = noteOf(S.user.id);
+    noteTrack = mine ? safeTrack(mine.track) : null;
+    const m = modal(`<h3>${mine ? "Leave a new note" : "New note"}</h3><form data-form="note">
+      <div class="field"><label>Share a thought (24h, 60 characters)</label><input name="text" maxlength="60" value="${esc(mine ? mine.text : "")}" placeholder="What's on your mind?" autocomplete="off"></div>
+      <div id="note-track">${trackChip()}</div>
+      <div class="field"><label>Add a song (optional)</label>${trackSearchHtml()}</div>
+      <div class="modal-actions"><button class="btn primary" type="submit">Share</button></div></form>
+      <div class="note-alt"><button class="btn block" data-action="add-story">Add to your story</button></div>`, { onClose: stopPreview });
+    wireTrackSearch(m.el, "Use", (t) => { noteTrack = t; const c = $("#note-track"); if (c) c.innerHTML = trackChip(); });
   };
   App.forms.note = async (form, data) => {
-    const text = data.text.trim(), music = (data.music || "").trim();
+    const text = (data.text || "").trim();
+    if (!text && !noteTrack) throw new Error("Write something or pick a song");
+    stopPreview();
+    const track = noteTrack;
     const list = (App.cacheGet("notes") || []).filter((n) => n.user.id !== S.user.id);
-    list.unshift({ user: { id: S.user.id, username: S.user.username, display_name: S.user.display_name, avatar_url: S.user.avatar_url }, text, music, created_at: new Date().toISOString() });
+    list.unshift({ user: { id: S.user.id, username: S.user.username, display_name: S.user.display_name, avatar_url: S.user.avatar_url }, text, music: "", track, created_at: new Date().toISOString() });
     App.cacheSet("notes", list); paintNotes(); App.closeAllModals();
-    try { await api.put("/users/me/note", { text, music }); toast("Note shared"); } catch (e) { App.cacheDrop("notes"); App.loadNotes().then(paintNotes); throw e; }
+    try { await api.put("/users/me/note", { text, music: "", track }); toast("Note shared"); } catch (e) { App.cacheDrop("notes"); App.loadNotes().then(paintNotes); throw e; }
   };
   App.actions["note-del"] = async () => {
-    App.cacheSet("notes", (App.cacheGet("notes") || []).filter((n) => n.user.id !== S.user.id)); paintNotes(); App.closeAllModals();
-    try { await api.del("/users/me/note"); } catch (e) { fail(e); }
+    App.closeAllModals();
+    App.cacheSet("notes", (App.cacheGet("notes") || []).filter((n) => n.user.id !== S.user.id)); paintNotes();
+    try { await api.del("/users/me/note"); toast("Note deleted"); } catch (e) { fail(e); }
+  };
+  /** Opens a note: shows it, plays the 30 s preview, and offers reply (friends) or new/delete (own). */
+  App.actions["note-view"] = (el, ev) => {
+    if (ev) ev.stopPropagation();
+    const n = noteOf(el.dataset.id); if (!n) return;
+    const mine = n.user.id === S.user.id, t = safeTrack(n.track);
+    const m = modal(`<div class="note-card">${avatar(n.user, "l")}<b>${esc(mine ? "Your note" : n.user.display_name)}</b>
+      ${n.text ? `<div class="nc-text">${esc(n.text)}</div>` : ""}
+      ${t ? `<div class="trk-chip big">${coverHtml(t)}<div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><span class="muted small">${esc(t.artist)}</span></div>${eqHtml}</div><audio class="nc-audio" controls src="${esc(t.url)}"></audio>`
+        : n.music ? `<div class="muted">♪ ${esc(n.music)}</div>` : ""}
+      <div class="muted small">${App.timeAgo(n.created_at)}</div>
+      ${mine ? `<div class="modal-actions"><button class="btn danger" data-action="note-del">Delete note</button><button class="btn primary" data-action="note-new">Leave a new note</button></div>`
+        : `<form data-form="note-reply" data-user="${esc(n.user.username)}"><div class="row"><input name="text" maxlength="500" placeholder="Reply to ${esc(n.user.display_name)}'s note..." autocomplete="off" required><button class="btn primary sm" type="submit">Send message</button></div></form>`}</div>`, { onClose: () => { const a = $(".nc-audio"); if (a) a.pause(); } });
+    const a = $(".nc-audio", m.el); if (a) a.play().catch(() => {});
+  };
+  App.actions["note-new"] = () => { App.closeAllModals(); App.actions["note-menu"](); };
+  App.forms["note-reply"] = async (form, data) => {
+    const username = form.dataset.user, text = (data.text || "").trim(); if (!text) return;
+    const n = (App.cacheGet("notes") || []).find((x) => x.user.username === username);
+    const res = await createChat("direct", "", "", [username]);
+    await loadChats(true);
+    const chat = find(res.id); if (!chat) throw new Error("Couldn't open the chat");
+    App.closeAllModals();
+    sendPayload(chat, { k: "text", t: text, r: { id: "note", n: n ? n.user.display_name : username, p: "Note: " + ((n && (n.text || (n.track && n.track.title))) || "").slice(0, 70) } });
+    toast("Reply sent");
+  };
+
+  // ---------- chat theme + details panel ----------
+  const THEMES = [["sky", "Classic Sky", "#38BDF8"], ["mono", "Monochrome", "#FFFFFF"], ["indigo", "Midnight Indigo", "linear-gradient(135deg,#6366F1,#4338CA)"], ["rose", "Crimson Rose", "#F43F5E"], ["mint", "Emerald Mint", "#10B981"], ["violet", "Royal Violet", "#A855F7"]];
+  const themeKey = (id) => "loka_chat_theme:" + id;
+  function getTheme(id) { try { const t = localStorage.getItem(themeKey(id)); return THEMES.some((x) => x[0] === t) ? t : "sky"; } catch (e) { return "sky"; } }
+  App.actions["chat-info"] = (el) => {
+    const chat = find(el.dataset.id); if (!chat) return;
+    const cur = getTheme(chat.id), isDirect = chat.type === "direct", o = other(chat);
+    const members = chat.type === "group" ? `<div class="sec-title"><h3>Members</h3></div><div class="list-card">${chat.members.map((u) => `<div class="user-row" data-action="open-profile" data-user="${esc(u.username)}">${avatar(u, "s")}<div class="grow"><b>${esc(u.display_name)}</b><div class="muted small">@${esc(u.username)}</div></div></div>`).join("")}</div>` : "";
+    App.drawer(`<h3 class="d-title">Details</h3><div class="d-body">
+      <div class="info-head">${avatarOf(chat, "xl")}<b>${esc(titleOf(chat))}</b>${isDirect ? `<span class="muted small">@${esc(o.username || "")}</span>` : ""}</div>
+      <div class="sec-title"><h3>Chat theme</h3></div>
+      <div class="theme-grid" data-chat="${esc(chat.id)}">${THEMES.map(([k, name, bg]) => `<button class="theme-opt ${k === cur ? "on" : ""}" data-action="set-theme" data-theme="${k}" data-chat="${esc(chat.id)}"><span class="sw" style="background:${bg}"></span><span>${esc(name)}</span></button>`).join("")}</div>
+      ${members}
+      <button class="btn danger block" style="margin-top:18px" data-action="leave-chat" data-id="${esc(chat.id)}">${icon("logout")}Leave conversation</button></div>`, { cls: "info" });
+  };
+  App.actions["set-theme"] = (el) => {
+    const id = el.dataset.chat, t = el.dataset.theme;
+    try { localStorage.setItem(themeKey(id), t); } catch (e) { /* ignore */ }
+    if (openId === id) { const c = $("#conv"); if (c) c.dataset.theme = t; }
+    $$(".theme-opt", el.closest(".theme-grid")).forEach((b) => b.classList.toggle("on", b === el));
   };
 
   // ---------- conversation list ----------
@@ -203,11 +335,12 @@
     openId = chat.id; replyTo = null;
     S.unread[chat.id] = 0; App.updateBadge();
     const conv = $("#conv");
+    conv.dataset.theme = getTheme(chat.id);
     conv.innerHTML = `<div class="conv-head"><button class="icon-btn back" data-action="conv-back" aria-label="Back">${icon("back")}</button>${avatarOf(chat)}
       <div class="grow"><b class="ellipsis" style="display:block">${esc(titleOf(chat))}</b>
       <span class="muted small">${chat.type === "direct" ? "@" + esc(other(chat).username || "") : chat.type === "group" ? chat.member_count + " members" : "Public channel"}</span></div>
-      ${chat.type === "channel" ? `<span class="e2ee">${icon("hash")}Broadcast</span>` : `<span class="e2ee">${icon("lock")}E2EE</span>`}
-      <button class="icon-btn" data-action="leave-chat" data-id="${esc(chat.id)}" aria-label="Leave" title="Leave">${icon("logout")}</button></div>
+      ${chat.type === "channel" ? `<span class="e2ee">${icon("hash")}Broadcast</span>` : ""}
+      <button class="icon-btn" data-action="chat-info" data-id="${esc(chat.id)}" aria-label="Chat details" title="Details">${icon("info")}</button></div>
       <div class="msgs" id="msgs"></div><div id="reply-bar" hidden></div><div id="picker" hidden></div>
       ${canPost(chat) ? composerHtml(chat) : `<div class="composer muted small" style="justify-content:center">Only channel admins can post here.</div>`}`;
     paintList();
@@ -223,9 +356,10 @@
     return `<form class="composer ig" data-form="send" data-id="${esc(chat.id)}" id="composer">
       <div class="pill-input">${e2e ? `<button type="button" class="ci" data-action="pick-toggle" aria-label="Emoji and GIFs">${icon("smile")}</button>` : ""}
       <input name="text" placeholder="${e2e ? "Message..." : "Broadcast to subscribers"}" autocomplete="off" maxlength="4000">
-      ${e2e ? `<span class="c-tools"><button type="button" class="ci" data-action="attach" aria-label="Photo, video or music clip">${icon("image")}</button><button type="button" class="ci" data-action="rec-toggle" aria-label="Voice message">${icon("mic")}</button></span>` : ""}
-      <button class="ci send" type="submit" aria-label="Send">${icon("send")}</button></div>
-      ${e2e ? `<input type="file" id="att-file" accept="image/*,video/*,audio/*" hidden>` : ""}</form>`;
+      ${e2e ? `<span class="c-tools att-wrap"><button type="button" class="ci" data-action="att-menu" aria-label="Attach">${icon("add")}</button><button type="button" class="ci" data-action="rec-toggle" aria-label="Voice message">${icon("mic")}</button></span>` : ""}
+      <button class="ci send" type="submit" aria-label="Send">${icon("send")}</button>
+      ${e2e ? `<div class="att-menu" id="att-menu" hidden><button type="button" data-action="attach">${icon("image")}<span>Photo or video</span></button><button type="button" data-action="pick-music">${icon("music")}<span>Music</span></button><button type="button" data-action="pick-gif">${icon("smile")}<span>GIF or sticker</span></button></div>` : ""}</div>
+      ${e2e ? `<input type="file" id="att-file" accept="image/*,video/*" hidden>` : ""}</form>`;
   };
   App.actions["conv-back"] = () => App.go("/messages");
 
@@ -249,7 +383,8 @@
     const mine = m.sender_id === S.user.id, pl = m.payload;
     const who = !mine && chat.type !== "direct" ? chat.members.find((x) => x.id === m.sender_id) : null;
     let body;
-    if (m.failed) body = `<span class="undec">🔒 Can't decrypt this message on this device<br><button class="link-btn small" data-action="restore-keys">Restore my keys</button></span>`;
+    if (m.failed) body = `<span class="undec">Message from earlier session</span>`;
+    else if (pl.k === "music") body = musicCard(pl);
     else if (pl.k === "gif") body = pl.u ? `<img class="gif" src="${esc(pl.u)}" alt="${esc(pl.t || "GIF")}" loading="lazy">` : `<span class="sticker">${esc(pl.t)}</span>`;
     else if (pl.k === "image" || pl.k === "video" || pl.k === "audio" || pl.k === "voice") body = attHtml(m);
     else body = `<span class="txt">${esc(pl.t)}</span>`;
@@ -271,7 +406,9 @@
           const m = (msgStore.get(chat.id) || []).find((x) => x.payload && x.payload.p === path);
           const res = await fetch(api.publicUrl(path));
           if (!res.ok) throw new Error("Attachment unavailable (" + res.status + ")");
-          const plain = await C.decryptBytes(await chatKey(chat), await res.arrayBuffer());
+          const key = m && m.payload.e === "f" ? await fbKey(chat) : await e2eKey(chat);
+          if (!key) throw new Error("Attachment from an earlier session");
+          const plain = await C.decryptBytes(key, await res.arrayBuffer());
           url = URL.createObjectURL(new Blob([plain], { type: (m && m.payload.m) || "application/octet-stream" }));
           attCache.set(path, url);
         }
@@ -281,8 +418,9 @@
   }
   function paintMessages(chat, list) {
     const box = $("#msgs"); if (!box || openId !== chat.id) return;
-    box.innerHTML = list.length ? list.map((m) => msgHtml(chat, m)).join("")
-      : `<div class="conv-empty"><div>${icon(chat.type === "channel" ? "hash" : "lock")}<p>${chat.type === "channel" ? "No broadcasts yet." : "No messages yet. Say hello - everything here is end-to-end encrypted."}</p></div></div>`;
+    const banner = chat.type === "channel" ? "" : `<div class="e2e-banner">${icon("lock")}<span>Messages in this chat are end-to-end encrypted. No one outside of this chat, not even LokaChat, can read, listen to, or share them.</span></div>`;
+    box.innerHTML = banner + (list.length ? list.map((m) => msgHtml(chat, m)).join("")
+      : `<div class="conv-empty"><div><p>${chat.type === "channel" ? "No broadcasts yet." : "No messages yet. Say hello!"}</p></div></div>`);
     box.scrollTop = box.scrollHeight;
     hydrate(chat);
   }
@@ -318,16 +456,17 @@
       let body;
       if (chat.type === "channel") body = { conversation_id: chat.id, ciphertext: tmp.payload.t, iv: "" };
       else {
-        const key = await chatKey(chat);
+        const { key, fb } = await sendKey(chat);
         if (tmp.payload._file) {                                // attachment: encrypt + upload first
           const f = tmp.payload._file;
           const bytes = await C.encryptBytes(key, await f.arrayBuffer());
           const path = `${S.user.id}/chat/${uid()}.bin`;
           await api.upload(path, new Blob([bytes], { type: "application/octet-stream" }), "application/octet-stream");
-          tmp.payload = { ...tmp.payload, p: path }; delete tmp.payload._file;
+          tmp.payload = { ...tmp.payload, p: path, e: fb ? "f" : "k" }; delete tmp.payload._file;
           attCache.set(path, tmp.localUrl);
         }
-        body = { conversation_id: chat.id, ...(await C.encryptText(key, JSON.stringify({ v: 1, ...tmp.payload }))) };
+        const sealed = await C.encryptText(key, JSON.stringify({ v: 1, ...tmp.payload }));
+        body = { conversation_id: chat.id, ciphertext: sealed.ciphertext, iv: fb ? "f." + sealed.iv : sealed.iv };
       }
       const sent = await api.post("/chats/send", body);
       const oldId = tmp.id;
@@ -451,7 +590,11 @@
   App.actions["pk-gif"] = (el) => { const chat = find(openId); if (chat) { $("#picker").hidden = true; sendPayload(chat, { k: "gif", u: el.dataset.u, t: el.dataset.t }); } };
 
   // ---------- attachments + voice ----------
-  App.actions.attach = () => { const f = $("#att-file"); if (f) f.click(); };
+  const closeAttMenu = () => { const m = $("#att-menu"); if (m) m.hidden = true; };
+  App.actions["att-menu"] = () => { const m = $("#att-menu"); if (m) m.hidden = !m.hidden; };
+  document.addEventListener("click", (e) => { if (!e.target.closest(".att-wrap") && !e.target.closest("#att-menu")) closeAttMenu(); }, true);
+  App.actions.attach = () => { closeAttMenu(); const f = $("#att-file"); if (f) f.click(); };
+  App.actions["pick-gif"] = () => { closeAttMenu(); const p = $("#picker"); if (!p) return; p.hidden = false; p.dataset.tab = "gif"; paintPicker(); };
   document.addEventListener("change", (e) => {
     if (e.target.id !== "att-file") return;
     const f = e.target.files[0]; e.target.value = "";
@@ -460,7 +603,7 @@
   function sendFile(chat, file, forceKind, dur) {
     if (file.size > MAX_ATT) { toast("Attachments can be up to 25 MB", "err"); return; }
     const kind = forceKind || (file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : file.type.startsWith("audio/") ? "audio" : null);
-    if (!kind) { toast("Choose a photo, video or audio file", "err"); return; }
+    if (!kind) { toast("Choose a photo or video", "err"); return; }
     const localUrl = URL.createObjectURL(file);
     const payload = { k: kind, m: file.type || "application/octet-stream", n: (file.name || "").slice(0, 80), s: file.size, d: dur || 0, _file: file, ...(replyTo ? { r: replyTo } : {}) };
     clearReply();
@@ -534,7 +677,7 @@
     await App.busy(el, async () => {
       await api.del("/chats/" + chat.id);
       S.chats = S.chats.filter((c) => c.id !== chat.id); App.cacheDrop("chats"); msgStore.delete(chat.id); keyCache.delete(chat.id);
-      toast("Left conversation"); App.go("/messages");
+      App.closeDrawers(); toast("Left conversation"); App.go("/messages");
     });
   };
 
@@ -545,18 +688,17 @@
       <div class="field" id="nc-users"><label id="nc-users-l">Their username</label><input name="users" placeholder="e.g. priya" autocomplete="off"></div>
       <div class="field" id="nc-title" hidden><label>Name</label><input name="title" maxlength="60"></div>
       <div class="field" id="nc-desc" hidden><label>Description (optional)</label><input name="description" maxlength="200"></div>
-      <p class="muted small" id="nc-hint">Direct and group chats are end-to-end encrypted. Everyone must have signed in to LokaChat at least once.</p>
+      <p class="muted small" id="nc-hint">Direct and group chats are end-to-end encrypted.</p>
       <div class="modal-actions"><button class="btn primary" type="submit">Create</button></div></form>`);
     $("#nc-type").addEventListener("change", () => {
       const t = $("#nc-type").value;
       $("#nc-users").hidden = t === "channel"; $("#nc-title").hidden = t === "direct"; $("#nc-desc").hidden = t !== "channel";
       $("#nc-users-l").textContent = t === "group" ? "Usernames (comma separated)" : "Their username";
-      $("#nc-hint").textContent = t === "channel" ? "Channels are public: anyone can find and join them, and only admins can post. Messages are not encrypted." : "Direct and group chats are end-to-end encrypted. Everyone must have signed in to LokaChat at least once.";
+      $("#nc-hint").textContent = t === "channel" ? "Channels are public: anyone can find and join them, and only admins can post. Messages are not encrypted." : "Direct and group chats are end-to-end encrypted.";
     });
   };
   async function createChat(type, title, description, usernames) {
     if (type === "channel") return api.post("/chats/create", { type, title, description, members: [] });
-    if (!S.identity) throw new Error("Encryption keys aren't set up on this device. Open You > Security & 2FA > Encryption keys.");
     const names = Array.from(new Set(usernames.map((u) => u.trim().toLowerCase().replace(/^@/, "")).filter(Boolean))).filter((n) => n !== S.user.username);
     if (!names.length) throw new Error("Add at least one other person");
     if (type === "direct" && names.length !== 1) throw new Error("A direct chat has exactly one other person");
@@ -564,12 +706,15 @@
     const byName = Object.fromEntries(users.map((u) => [u.username, u]));
     const missing = names.filter((n) => !byName[n]);
     if (missing.length) throw new Error("User not found: " + missing.join(", "));
-    const noKey = names.filter((n) => !byName[n].public_key);
-    if (noKey.length) throw new Error(`${noKey.join(", ")} hasn't opened LokaChat since signing up, so they have no encryption key yet.`);
-    const raw = await C.newChatKeyRaw();
-    const mine = S.identity;
-    const members = await Promise.all(names.map(async (n) => ({ username: n, wrapped_key: await C.wrapChatKey(raw, mine.privateKey, JSON.parse(byName[n].public_key), mine.publicJwk) })));
-    const my_wrapped_key = await C.wrapChatKey(raw, mine.privateKey, mine.publicJwk, mine.publicJwk);
+    let members, my_wrapped_key;
+    try {
+      if (!S.identity || names.some((n) => !byName[n].public_key)) throw new Error("no key");
+      const raw = await C.newChatKeyRaw(), mine = S.identity;
+      members = await Promise.all(names.map(async (n) => ({ username: n, wrapped_key: await C.wrapChatKey(raw, mine.privateKey, JSON.parse(byName[n].public_key), mine.publicJwk) })));
+      my_wrapped_key = await C.wrapChatKey(raw, mine.privateKey, mine.publicJwk, mine.publicJwk);
+    } catch (e) {                     // missing key or OperationError: silently use the fallback conversation key
+      members = names.map((n) => ({ username: n, wrapped_key: "fb1" })); my_wrapped_key = "fb1";
+    }
     return api.post("/chats/create", { type, title, description, members, my_wrapped_key });
   }
   App.forms["new-chat"] = async (form, data) => {

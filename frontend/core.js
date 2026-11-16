@@ -316,14 +316,14 @@
   });
   document.addEventListener("click", (e) => { if (App.closeMenus && !e.target.closest("[data-menu-root]")) App.closeMenus(); }, true);
 
-  // ---------- sidebar (YouTube-style toggle; the wordmark never collapses) ----------
+  // ---------- sidebar (arrow toggle next to the wordmark; the wordmark never collapses) ----------
   const PIN_KEY = "loka_rail_pinned";
   App.applyPin = () => {
     let on = false;
     try { on = localStorage.getItem(PIN_KEY) === "1"; } catch (e) { /* ignore */ }
     document.body.classList.toggle("pinned", on);
     const b = $("#rail-toggle");
-    if (b) { b.innerHTML = App.icon(on ? "menu" : "arrow-right"); b.setAttribute("aria-label", on ? "Collapse sidebar" : "Expand sidebar"); }
+    if (b) { b.innerHTML = App.icon(on ? "arrow-left" : "arrow-right"); b.setAttribute("aria-label", on ? "Collapse sidebar" : "Pin sidebar open"); }
   };
   App.actions["toggle-pin"] = () => {
     const on = !document.body.classList.contains("pinned");

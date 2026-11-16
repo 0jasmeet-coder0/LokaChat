@@ -427,7 +427,7 @@
   // ============================================================ Notifications drawer
   let notifTimer = 0;
   const setDot = (n) => {
-    ["#notif-dot", "#notif-dot-m"].forEach((id) => { const d = $(id); if (d) { d.hidden = !n; d.textContent = n > 9 ? "9+" : String(n || ""); } });
+    ["#notif-dot", "#notif-dot-m", "#notif-dot-r"].forEach((id) => { const d = $(id); if (d) { d.hidden = !n; d.textContent = n > 9 ? "9+" : String(n || ""); } });
   };
   App.pollNotifs = async () => {
     try { const r = await api.get("/users/notifications"); App.cacheSet("notifs", r); setDot(r.unread); return r; } catch (e) { return null; }
