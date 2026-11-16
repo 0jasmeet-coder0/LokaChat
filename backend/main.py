@@ -98,7 +98,7 @@ def me_shape(u: dict) -> dict:
     uid = u["id"]
     d = pub(u, key=True)
     d.update({
-        "contact": auth.mask_contact(u.get("email") or u.get("phone") or ""),
+        "key_backup": u.get("key_backup"),  # password-encrypted E2EE key (opaque to the server)
         "totp_enabled": bool(u.get("totp_enabled")),
         "followers": count(rows(table("follows").select("follower_id").eq("following_id", uid))),
         "following": count(rows(table("follows").select("following_id").eq("follower_id", uid))),
@@ -336,7 +336,10 @@ def update_me(body: ProfileUpdate, user: dict = Depends(current_user)):
 @app.put("/users/me/key")
 def set_public_key(body: KeyIn, user: dict = Depends(current_user)):
     """Store the user's ECDH public key (JWK) used by other members to wrap chat keys."""
-    table("users").update({"public_key": body.public_key}).eq("id", user["id"]).execute()
+    changes = {"public_key": body.public_key}
+    if body.key_backup:
+        changes["key_backup"] = body.key_backup
+    table("users").update(changes).eq("id", user["id"]).execute()
     return {"ok": True}
 
 
@@ -369,21 +372,36 @@ def list_following(user: dict = Depends(current_user)):
 
 @app.get("/users/notifications")
 def notifications(user: dict = Depends(current_user)):
-    items = []
-    fol = rows(table("follows").select("*").eq("following_id", user["id"]).order("created_at", desc=True).limit(20))
-    ids = list({f["follower_id"] for f in fol})
+    """Follows + likes + comments on my posts, with an unread count since notifs_seen_at."""
+    uid = user["id"]
+    fol = rows(table("follows").select("*").eq("following_id", uid).order("created_at", desc=True).limit(30))
+    mine = rows(table("posts").select("*").eq("author_id", uid).neq("type", "story").order("created_at", desc=True).limit(100))
+    pmap = {p["id"]: p for p in mine}
+    likes = rows(table("post_likes").select("*").in_("post_id", list(pmap)).neq("user_id", uid).order("created_at", desc=True).limit(40)) if pmap else []
+    coms = rows(table("comments").select("*").in_("post_id", list(pmap)).neq("author_id", uid).order("created_at", desc=True).limit(40)) if pmap else []
+    ids = list({f["follower_id"] for f in fol} | {x["user_id"] for x in likes} | {c["author_id"] for c in coms})
     people = {u["id"]: u for u in rows(table("users").select("*").in_("id", ids))} if ids else {}
-    items += [{"type": "follow", "user": pub(people.get(f["follower_id"])), "at": f["created_at"]} for f in fol if f["follower_id"] in people]
-    followed = following_ids(user["id"])
-    if followed:
-        posts = rows(table("posts").select("*").in_("author_id", followed).in_("type", ["video", "photo", "clip"])
-                     .order("created_at", desc=True).limit(20))
-        authors = {u["id"]: u for u in rows(table("users").select("*").in_("id", list({p["author_id"] for p in posts})))} if posts else {}
-        items += [{"type": "post", "user": pub(authors.get(p["author_id"])), "at": p["created_at"],
-                   "post": {"id": p["id"], "title": p["title"], "type": p["type"], "poster_url": public_url(p.get("poster_path"))}}
-                  for p in posts if p["author_id"] in authors]
+
+    def brief(p: dict) -> dict:
+        thumb = p.get("poster_path") or (p.get("media_path") if p["type"] == "photo" else None)
+        return {"id": p["id"], "type": p["type"], "title": p.get("title") or (p.get("caption") or "")[:60], "poster_url": public_url(thumb)}
+
+    items = [{"type": "follow", "user": pub(people[f["follower_id"]]), "at": f["created_at"]} for f in fol if f["follower_id"] in people]
+    items += [{"type": "like", "user": pub(people[x["user_id"]]), "post": brief(pmap[x["post_id"]]), "at": x["created_at"]}
+              for x in likes if x["user_id"] in people]
+    items += [{"type": "comment", "user": pub(people[c["author_id"]]), "post": brief(pmap[c["post_id"]]), "text": c["body"][:120], "at": c["created_at"]}
+              for c in coms if c["author_id"] in people]
     items.sort(key=lambda i: i["at"], reverse=True)
-    return {"items": items[:30]}
+    items = items[:40]
+    seen = user.get("notifs_seen_at") or user.get("created_at")
+    unread = sum(1 for i in items if seen and parse_ts(i["at"]) > parse_ts(seen))
+    return {"items": items, "unread": unread}
+
+
+@app.post("/users/notifications/seen")
+def notifications_seen(user: dict = Depends(current_user)):
+    table("users").update({"notifs_seen_at": iso(now())}).eq("id", user["id"]).execute()
+    return {"ok": True}
 
 
 @app.get("/users/{username}")
@@ -436,9 +454,11 @@ def shape_posts(posts: list, user: dict) -> list:
         return []
     authors = {u["id"]: u for u in rows(table("users").select("*").in_("id", list({p["author_id"] for p in posts})))}
     liked = {r["post_id"] for r in rows(table("post_likes").select("post_id").eq("user_id", user["id"]).in_("post_id", [p["id"] for p in posts]))}
+    saved = {r["post_id"] for r in rows(table("saved_posts").select("post_id").eq("user_id", user["id"]).in_("post_id", [p["id"] for p in posts]))}
     return [{
         "id": p["id"], "type": p["type"], "title": p["title"], "caption": p.get("caption") or "",
-        "visibility": p["visibility"], "mime": p["mime"], "duration": p.get("duration") or 0,
+        "visibility": p["visibility"], "mime": p.get("mime") or "", "duration": p.get("duration") or 0,
+        "comments": p.get("comments") or 0, "music": p.get("music") or "", "saved": p["id"] in saved,
         "media_url": public_url(p["media_path"]), "poster_url": public_url(p.get("poster_path")),
         "views": p.get("views") or 0, "likes": p.get("likes") or 0, "liked": p["id"] in liked,
         "created_at": p["created_at"], "expires_at": p.get("expires_at"), "author": pub(authors.get(p["author_id"])),
@@ -449,19 +469,29 @@ def shape_posts(posts: list, user: dict) -> list:
 def create_post(body: PostCreate, user: dict = Depends(current_user)):
     media = valid_path(body.media_path, user)
     poster = valid_path(body.poster_path, user)
-    video, image = body.mime.startswith("video/"), body.mime.startswith("image/")
-    if body.type in ("video", "clip") and not video:
-        raise HTTPException(400, "A video file is required")
-    if body.type == "photo" and not image:
-        raise HTTPException(400, "An image file is required")
-    if body.type == "story" and not (video or image):
-        raise HTTPException(400, "Stories must be a photo or video")
-    if body.type != "story" and not body.title.strip():
-        raise HTTPException(422, "A title is required")
+    mime = body.mime or ""
+    video, image = mime.startswith("video/"), mime.startswith("image/")
+    if body.type == "community":                       # text post, optionally with one image
+        if not (body.title.strip() or body.caption.strip()):
+            raise HTTPException(422, "Write something to share")
+        if media and not image:
+            raise HTTPException(400, "Community posts can include an image")
+    else:
+        if not media:
+            raise HTTPException(422, "A media file is required")
+        if body.type in ("video", "clip") and not video:
+            raise HTTPException(400, "A video file is required")
+        if body.type == "photo" and not image:
+            raise HTTPException(400, "An image file is required")
+        if body.type == "story" and not (video or image):
+            raise HTTPException(400, "Stories must be a photo or video")
+        if body.type != "story" and not body.title.strip():
+            raise HTTPException(422, "A title is required")
     row = {
         "author_id": user["id"], "type": body.type, "title": body.title.strip(), "caption": body.caption.strip(),
         "visibility": "followers" if body.type == "story" else "public" if body.type == "clip" else body.visibility,
-        "media_path": media, "poster_path": poster, "mime": body.mime, "duration": body.duration, "size": body.size,
+        "media_path": media, "poster_path": poster, "mime": mime or None, "duration": body.duration, "size": body.size,
+        "music": body.music.strip(),
         "expires_at": iso(now() + timedelta(hours=24)) if body.type == "story" else None,
     }
     created = rows(table("posts").insert(row))[0]
@@ -469,7 +499,7 @@ def create_post(body: PostCreate, user: dict = Depends(current_user)):
 
 
 @app.get("/posts/feed")
-def feed(tab: Literal["recommended", "following", "clips", "stories", "mine", "user"] = "recommended",
+def feed(tab: Literal["recommended", "following", "clips", "stories", "mine", "user", "community", "saved"] = "recommended",
          q: str = Query("", max_length=60), username: str = Query("", max_length=40),
          before: Optional[str] = None, limit: int = Query(30, ge=1, le=60), user: dict = Depends(current_user)):
     uid, followed = user["id"], following_ids(user["id"])
@@ -489,8 +519,14 @@ def feed(tab: Literal["recommended", "following", "clips", "stories", "mine", "u
         found = rows(base().eq("visibility", "public").eq("type", "clip").order("created_at", desc=True).limit(limit))
     elif tab == "following":
         if followed:
-            found += rows(base().in_("author_id", followed).in_("type", ["video", "photo", "clip"]).order("created_at", desc=True).limit(limit))
-        found += rows(base().eq("author_id", uid).eq("visibility", "followers").in_("type", ["video", "photo", "clip"]).order("created_at", desc=True).limit(limit))
+            found += rows(base().in_("author_id", followed).in_("type", ["video", "photo", "clip", "community"]).order("created_at", desc=True).limit(limit))
+        found += rows(base().eq("author_id", uid).eq("visibility", "followers").in_("type", ["video", "photo", "clip", "community"]).order("created_at", desc=True).limit(limit))
+    elif tab == "community":
+        found = rows(base().eq("type", "community").eq("visibility", "public").order("created_at", desc=True).limit(limit))
+        found += rows(base().eq("type", "community").eq("visibility", "followers").in_("author_id", followed + [uid]).order("created_at", desc=True).limit(limit))
+    elif tab == "saved":
+        sids = [r["post_id"] for r in rows(table("saved_posts").select("post_id").eq("user_id", uid).order("created_at", desc=True).limit(100))]
+        found = [p for p in rows(base().in_("id", sids)) if can_view(p, user, set(followed))] if sids else []
     elif tab == "stories":
         found = rows(base().in_("author_id", followed + [uid]).eq("type", "story").gt("expires_at", iso(now())).order("created_at", desc=True).limit(100))
     elif tab == "mine":
@@ -660,7 +696,12 @@ def chat_messages(conversation_id: str, before: Optional[str] = None, limit: int
     if before:
         qb = qb.lt("created_at", before)
     msgs = rows(qb.order("created_at", desc=True).limit(limit))
-    return {"messages": [shape_message(m) for m in reversed(msgs)]}
+    reacts: dict = {}
+    if msgs:
+        for rx in rows(table("message_reactions").select("*").in_("message_id", [m["id"] for m in msgs])):
+            if rx.get("emoji"):
+                reacts.setdefault(rx["message_id"], []).append({"user_id": rx["user_id"], "emoji": rx["emoji"]})
+    return {"messages": [{**shape_message(m), "reactions": reacts.get(m["id"], [])} for m in reversed(msgs)]}
 
 
 @app.post("/chats/send")
@@ -718,3 +759,14 @@ def discover_channels(q: str = Query("", max_length=40), user: dict = Depends(cu
     owners = {u["id"]: u for u in rows(table("users").select("*").in_("id", list({c["creator_id"] for c in found if c.get("creator_id")})))} if found else {}
     return {"channels": [{"id": c["id"], "title": c["title"], "description": c.get("description") or "",
                           "owner": pub(owners.get(c["creator_id"])), "joined": c["id"] in mine} for c in found]}
+
+
+# ====================================================== social (comments, saves, notes, reactions)
+from types import SimpleNamespace  # noqa: E402
+
+import social  # noqa: E402
+
+app.include_router(social.build_router(SimpleNamespace(
+    current_user=current_user, pub=pub, rows=rows, first=first, table=table, now=now, iso=iso, limiter=limiter,
+    following_ids=following_ids, viewable_post=viewable_post, shape_posts=shape_posts, membership=membership, valid_path=valid_path,
+)))

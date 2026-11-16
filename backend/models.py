@@ -108,6 +108,7 @@ class ProfileUpdate(BaseModel):
 
 class KeyIn(BaseModel):
     public_key: str = Field(min_length=20, max_length=2000)
+    key_backup: Optional[str] = Field(default=None, max_length=4000)  # password-encrypted private key (opaque)
 
 
 class KeysIn(BaseModel):
@@ -115,13 +116,14 @@ class KeysIn(BaseModel):
 
 
 class PostCreate(BaseModel):
-    type: Literal["video", "clip", "photo", "story"]
+    type: Literal["video", "clip", "photo", "story", "community"]
     title: str = Field(default="", max_length=100)
-    caption: str = Field(default="", max_length=500)
+    caption: str = Field(default="", max_length=1000)
     visibility: Literal["public", "followers"] = "public"
-    media_path: str = Field(min_length=3, max_length=300)
+    media_path: Optional[str] = Field(default=None, min_length=3, max_length=300)
     poster_path: Optional[str] = Field(default=None, max_length=300)
-    mime: str = Field(min_length=3, max_length=100)
+    mime: Optional[str] = Field(default=None, max_length=100)
+    music: str = Field(default="", max_length=80)
     duration: float = Field(default=0, ge=0, le=86400)
     size: int = Field(default=0, ge=0)
 
@@ -156,6 +158,50 @@ class ChatCreate(BaseModel):
     description: str = Field(default="", max_length=200)
     members: List[ChatMemberKey] = Field(default_factory=list, max_length=50)
     my_wrapped_key: Optional[str] = Field(default=None, max_length=2000)
+
+
+class CommentIn(BaseModel):
+    post_id: str
+    body: str = Field(min_length=1, max_length=500)
+    parent_id: Optional[str] = None
+
+    @field_validator("post_id")
+    @classmethod
+    def _p(cls, v): return check_uuid(v)
+
+    @field_validator("parent_id")
+    @classmethod
+    def _c(cls, v): return check_uuid(v) if v else None
+
+
+class CommentLikeIn(BaseModel):
+    comment_id: str
+
+    @field_validator("comment_id")
+    @classmethod
+    def _id(cls, v): return check_uuid(v)
+
+
+class SaveIn(BaseModel):
+    post_id: str
+
+    @field_validator("post_id")
+    @classmethod
+    def _id(cls, v): return check_uuid(v)
+
+
+class NoteIn(BaseModel):
+    text: str = Field(min_length=1, max_length=60)
+    music: str = Field(default="", max_length=60)
+
+
+class ReactIn(BaseModel):
+    message_id: str
+    emoji: str = Field(default="", max_length=16)  # "" removes my reaction
+
+    @field_validator("message_id")
+    @classmethod
+    def _id(cls, v): return check_uuid(v)
 
 
 class SendIn(BaseModel):

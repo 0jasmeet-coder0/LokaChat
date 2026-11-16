@@ -1,15 +1,38 @@
 /* =====================================================================
-   LokaChat - views.js
-   Home feed, story bar + story viewer, theater player, Clips, Post (upload),
-   Search, Notifications and the public profile modal.
+   LokaChat - views.js   (v4)
+   Stories (bar + viewer), post cards with hover-preview, the Home video hub
+   (Recommended / Following / Community), community posts, Create, Search,
+   notifications drawer, follow helpers and the public-profile modal.
+   The watch page, player, comments and Reels live in watch.js.
    ===================================================================== */
 (function () {
   "use strict";
   const { S, $, $$, esc, icon, avatar, toast, fail, modal, confirm: confirmBox } = App;
   const api = window.LokaApi;
   const MAX_BYTES = 50 * 1024 * 1024; // matches the Supabase free-plan bucket limit set in schema.sql
+  const isVideo = (p) => (p.mime || "").startsWith("video/");
 
-  const remember = (posts) => posts.forEach((p) => S.postCache.set(p.id, p));
+  // ============================================================ follow (optimistic)
+  const isFollowing = (u) => (u.is_following != null ? !!u.is_following : S.following.has(u.username));
+  App.isFollowing = isFollowing;
+  App.followBtn = (u, cls) => u.is_me || u.id === S.user.id ? "" :
+    `<button class="${cls || "btn sm"} ${isFollowing(u) ? "" : "primary"}" data-action="follow" data-user="${esc(u.username)}" data-following="${isFollowing(u) ? 1 : 0}">${isFollowing(u) ? "Following" : "Follow"}</button>`;
+  const paintFollow = (username, on) => $$(`[data-action="follow"][data-user="${username}"]`).forEach((b) => {
+    b.dataset.following = on ? "1" : "0"; b.textContent = on ? "Following" : "Follow"; b.classList.toggle("primary", !on);
+  });
+  App.actions.follow = async (el, ev) => {
+    ev.stopPropagation();
+    const name = el.dataset.user, on = el.dataset.following !== "1";
+    on ? S.following.add(name) : S.following.delete(name);
+    paintFollow(name, on);
+    try {
+      await api.post("/users/follow", { username: name, follow: on });
+      App.cacheDrop("feed:following", "stories", "notes", "profile:");
+    } catch (e) {
+      on ? S.following.delete(name) : S.following.add(name);
+      paintFollow(name, !on); fail(e, "Couldn't update follow");
+    }
+  };
 
   // ============================================================ stories
   const VIEWED_KEY = "loka_viewed_stories";
@@ -19,15 +42,16 @@
     try { localStorage.setItem(VIEWED_KEY, JSON.stringify(Array.from(viewed).slice(-500))); } catch (e) { /* ignore */ }
   };
   const groupSeen = (g) => g.items.every((s) => viewed.has(s.id));
-  let storyCache = { at: 0, groups: [] };
+  App.groupSeen = groupSeen;
 
-  /** Stories (own + people you follow), grouped per author - own group first, unseen before seen. */
+  /** Stories (own + people you follow), grouped per author - own first, unseen before seen. Cached 30s. */
   App.loadStories = async (force) => {
-    if (!force && Date.now() - storyCache.at < 30000) return storyCache.groups;
+    const hit = S.cache.stories;
+    if (!force && hit && Date.now() - hit.at < 30000) return hit.data;
     const { posts } = await api.get("/posts/feed?tab=stories");
-    remember(posts);
+    App.remember(posts);
     const map = new Map();
-    posts.slice().reverse().forEach((p) => {                 // oldest first inside a group
+    posts.slice().reverse().forEach((p) => {
       if (!map.has(p.author.id)) map.set(p.author.id, { author: p.author, items: [] });
       map.get(p.author.id).items.push(p);
     });
@@ -35,7 +59,7 @@
       const mine = (g) => (g.author.id === S.user.id ? 0 : 1);
       return mine(a) - mine(b) || groupSeen(a) - groupSeen(b);
     });
-    storyCache = { at: Date.now(), groups };
+    App.cacheSet("stories", groups);
     return groups;
   };
 
@@ -43,22 +67,22 @@
     const mine = groups.find((g) => g.author.id === S.user.id);
     let html = "";
     if (withAdd) {
-      html += `<div class="story-item" ${mine ? 'data-action="open-story" data-i="' + groups.indexOf(mine) + '"' : 'data-action="add-story"'}>
+      html += `<div class="story-item" ${mine ? `data-action="open-story" data-id="${esc(S.user.id)}"` : 'data-action="add-story"'}>
         <span class="story-add">${avatar(S.user, "l", mine ? (groupSeen(mine) ? "seen" : "new") : null, mine ? S.user.id : null)}
         <span class="plus" data-action="add-story">+</span></span><span class="nm ellipsis">Your story</span></div>`;
     }
-    groups.forEach((g, i) => {
+    groups.forEach((g) => {
       if (g.author.id === S.user.id && withAdd) return;
-      html += `<div class="story-item" data-action="open-story" data-i="${i}">${avatar(g.author, "l", groupSeen(g) ? "seen" : "new", g.author.id)}
+      html += `<div class="story-item" data-action="open-story" data-id="${esc(g.author.id)}">${avatar(g.author, "l", groupSeen(g) ? "seen" : "new", g.author.id)}
         <span class="nm ellipsis">${esc(g.author.id === S.user.id ? "Your story" : g.author.display_name)}</span></div>`;
     });
     return html;
   };
-
   App.actions["add-story"] = (el, ev) => { ev.stopPropagation(); S.postPreset = "story"; App.go("/post"); };
   App.actions["open-story"] = async (el) => {
     const groups = await App.loadStories();
-    openStories(groups, Number(el.dataset.i));
+    const i = groups.findIndex((g) => g.author.id === el.dataset.id);
+    if (i >= 0) openStories(groups, i);
   };
 
   function openStories(groups, gi) {
@@ -66,7 +90,6 @@
     const root = document.createElement("div");
     root.className = "story-view";
     document.body.appendChild(root);
-
     const close = () => {
       gone = true; cancelAnimationFrame(raf);
       document.removeEventListener("keydown", onKey, true);
@@ -78,13 +101,12 @@
       else if (e.key === "ArrowRight") next(); else if (e.key === "ArrowLeft") prev();
     };
     document.addEventListener("keydown", onKey, true);
-
     function show() {
       cancelAnimationFrame(raf);
       const g = groups[gi], s = g.items[ii];
       markViewed(s.id);
       if (s.author.id !== S.user.id) api.post("/posts/view", { post_id: s.id }).catch(() => {});
-      const isVid = s.mime.startsWith("video/");
+      const isVid = isVideo(s);
       root.innerHTML = `<div class="story-stage">
         <div class="story-top"><div class="story-bars">${g.items.map((_, k) => `<i><b style="width:${k < ii ? 100 : 0}%"></b></i>`).join("")}</div>
           <div class="row">${avatar(g.author, "s")}<div class="grow"><b>${esc(g.author.display_name)}</b>
@@ -108,7 +130,6 @@
     }
     function next() { const g = groups[gi]; if (ii < g.items.length - 1) { ii++; show(); } else if (gi < groups.length - 1) { gi++; ii = 0; show(); } else close(); }
     function prev() { if (ii > 0) { ii--; show(); } else if (gi > 0) { gi--; ii = 0; show(); } else show(); }
-
     root.addEventListener("click", async (e) => {
       const b = e.target.closest("[data-sv]");
       if (!b) return;
@@ -122,180 +143,200 @@
           const s = groups[gi].items[ii];
           await api.del("/posts/" + s.id);
           groups[gi].items.splice(ii, 1);
-          storyCache.at = 0;
+          App.cacheDrop("stories");
           if (!groups[gi].items.length) { groups.splice(gi, 1); if (!groups.length) { close(); return; } ii = 0; if (gi >= groups.length) gi = groups.length - 1; }
           else if (ii >= groups[gi].items.length) ii = groups[gi].items.length - 1;
-          show();
-          toast("Story deleted");
+          show(); toast("Story deleted");
         } catch (err) { fail(err); show(); }
       }
     });
     show();
   }
 
-  // ============================================================ post card + player
+  // ============================================================ cards
+  const kindIcon = (p) => (p.type === "photo" ? "image" : p.type === "clip" ? "clips" : "play");
+  const kindLabel = (p) => (p.type === "photo" ? "Photo" : p.type === "clip" ? "Reel" : "Video");
+  App.postThumb = (p) => p.poster_url || (p.type === "photo" || p.type === "community" ? p.media_url : "") || "";
+
   function vcard(p) {
-    const isPhoto = p.type === "photo";
-    const thumb = p.poster_url || (isPhoto ? p.media_url : "");
+    if (p.type === "community") return ccard(p);
+    const thumb = App.postThumb(p);
     return `<article class="vcard" data-action="open-post" data-id="${esc(p.id)}">
-      <div class="thumb">${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : ""}
-        <span class="kind">${icon(isPhoto ? "image" : p.type === "clip" ? "clips" : "play")}${isPhoto ? "Photo" : p.type === "clip" ? "Clip" : "Video"}</span>
+      <div class="thumb" ${isVideo(p) ? `data-prev="${esc(p.media_url)}"` : ""}>${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : ""}
+        <span class="kind">${icon(kindIcon(p))}${kindLabel(p)}</span>
         ${p.duration ? `<span class="dur">${App.dur(p.duration)}</span>` : ""}</div>
       <div class="vmeta"><span data-action="open-profile" data-user="${esc(p.author.username)}">${avatar(p.author, "s")}</span>
         <div class="grow"><div class="vtitle">${esc(p.title)}</div>
         <div class="muted small">${esc(p.author.display_name)} · ${App.num(p.views)} views · ${App.timeAgo(p.created_at)}</div></div></div></article>`;
   }
   App.vcard = vcard;
-  const emptyBox = (ic, title, text, btn) => `<div class="empty">${icon(ic)}<h3>${esc(title)}</h3><p>${esc(text)}</p>${btn || ""}</div>`;
-  App.emptyBox = emptyBox;
 
-  App.actions["open-post"] = (el) => { const p = S.postCache.get(el.dataset.id); if (p) openPost(p); };
+  const likeBtn = (p, cls) => `<button class="chip-btn ${cls || ""} ${p.liked ? "liked" : ""}" data-action="like" data-like="${esc(p.id)}" data-id="${esc(p.id)}" aria-label="Like">${icon("heart")}<span class="n">${App.num(p.likes)}</span></button>`;
+  const saveBtn = (p) => `<button class="chip-btn ${p.saved ? "liked" : ""}" data-action="save-post" data-save="${esc(p.id)}" data-id="${esc(p.id)}" aria-label="Save">${icon("bookmark")}</button>`;
+  App.likeBtn = likeBtn; App.saveBtn = saveBtn;
+
+  /** Community post card (text + optional image). Double-click / double-tap likes it. */
+  function ccard(p) {
+    return `<article class="ccard card" data-dbl="like-post" data-id="${esc(p.id)}">
+      <div class="row"><span data-action="open-profile" data-user="${esc(p.author.username)}">${avatar(p.author, "s")}</span>
+        <div class="grow"><b>${esc(p.author.display_name)}</b><div class="muted small">@${esc(p.author.username)} · ${App.timeAgo(p.created_at)}</div></div></div>
+      ${p.title ? `<h3 class="c-title">${esc(p.title)}</h3>` : ""}
+      ${p.caption ? `<p class="c-text">${esc(p.caption)}</p>` : ""}
+      ${p.media_url ? `<img class="c-img" src="${esc(p.media_url)}" alt="" loading="lazy">` : ""}
+      <div class="row c-actions">${likeBtn(p)}<button class="chip-btn" data-action="comments" data-id="${esc(p.id)}">${icon("comment")}<span class="n" data-ccount="${esc(p.id)}">${App.num(p.comments)}</span></button>
+        <button class="chip-btn" data-action="share" data-id="${esc(p.id)}">${icon("share")}</button><span class="grow"></span>${saveBtn(p)}
+        ${p.author.id === S.user.id ? `<button class="chip-btn" data-action="delete-post" data-id="${esc(p.id)}" aria-label="Delete">${icon("trash")}</button>` : ""}</div></article>`;
+  }
+  App.dbl["like-post"] = (el, pt) => { App.burst(el, pt); App.toggleLike(el.dataset.id, "on"); };
+
+  App.actions["open-post"] = (el) => { const p = S.postCache.get(el.dataset.id); if (p) App.openPost(p); };
+  App.openPost = (p) => {
+    App.closeAllModals();
+    if (p.type === "community") { App.openComments(p.id); return; }
+    App.go("/watch/" + p.id);
+  };
   App.actions["open-profile"] = (el, ev) => { ev.stopPropagation(); openProfile(el.dataset.user); };
 
-  App.actions.like = async (el, ev) => {
+  App.actions["save-post"] = async (el, ev) => {
     ev.stopPropagation();
-    const id = el.dataset.id;
-    await App.busy(el, async () => {
-      const r = await api.post("/posts/like", { post_id: id });
-      const p = S.postCache.get(id);
-      if (p) { p.liked = r.liked; p.likes = r.likes; }
-      $$(`[data-action="like"][data-id="${id}"]`).forEach((b) => {
-        b.classList.toggle("liked", r.liked);
-        const n = b.querySelector(".n"); if (n) n.textContent = App.num(r.likes);
-      });
-    });
+    const p = S.postCache.get(el.dataset.id);
+    if (!p) return;
+    const paint = () => $$(`[data-save="${p.id}"]`).forEach((b) => b.classList.toggle("liked", !!p.saved));
+    p.saved = !p.saved; paint();
+    try {
+      const r = await api.post("/posts/save", { post_id: p.id });
+      p.saved = r.saved; paint(); App.cacheDrop("feed:saved"); toast(r.saved ? "Saved" : "Removed from saved");
+    } catch (e) { p.saved = !p.saved; paint(); fail(e, "Couldn't save"); }
   };
-  const likeBtn = (p) => `<button class="chip-btn ${p.liked ? "liked" : ""}" data-action="like" data-id="${esc(p.id)}">${icon("heart")}<span class="n">${App.num(p.likes)}</span></button>`;
-
-  function openPost(p) {
-    const isVid = p.mime.startsWith("video/");
-    let lastSent = 0, counted = false, vidEl = null;
-    const send = (count) => {
-      const pos = vidEl ? vidEl.currentTime || 0 : 0;
-      const dur = vidEl && isFinite(vidEl.duration) ? vidEl.duration : p.duration || 0;
-      return api.post("/posts/view", { post_id: p.id, position: pos, duration: dur, count }).then((r) => {
-        if (count && r && typeof r.views === "number") { p.views = r.views; }
-      }).catch(() => {});
-    };
-    const m = modal(`<div class="player">${isVid ? `<video src="${esc(p.media_url)}" ${p.poster_url ? `poster="${esc(p.poster_url)}"` : ""} controls autoplay playsinline></video>`
-      : `<img class="full" src="${esc(p.media_url)}" alt="${esc(p.title)}">`}
-      <div class="player-info"><h3 style="padding-right:0">${esc(p.title)}</h3>
-        <div class="row" style="margin:8px 0;flex-wrap:wrap"><span class="row" data-action="open-profile" data-user="${esc(p.author.username)}" style="cursor:pointer">${avatar(p.author, "s")}<b>${esc(p.author.display_name)}</b></span>
-        <span class="muted small grow">${App.num(p.views)} views · ${App.timeAgo(p.created_at)}</span>${likeBtn(p)}
-        ${p.author.id === S.user.id ? `<button class="chip-btn" data-action="delete-post" data-id="${esc(p.id)}">${icon("trash")}Delete</button>` : ""}</div>
-        ${p.caption ? `<p class="muted" style="white-space:pre-wrap;margin:6px 0 0">${esc(p.caption)}</p>` : ""}</div></div>`,
-      { cls: "player", noFocus: true, onClose: () => { if (vidEl) { vidEl.pause(); send(false); } } });
-    vidEl = $("video", m.el);
-    if (vidEl) {
-      vidEl.addEventListener("play", () => { if (!counted) { counted = true; send(true); } });
-      vidEl.addEventListener("timeupdate", () => { if (Date.now() - lastSent > 10000) { lastSent = Date.now(); send(false); } });
-    } else send(true);
-  }
-  App.openPost = openPost;
-
+  App.actions.share = async (el, ev) => {
+    ev.stopPropagation();
+    const url = location.origin + location.pathname + "#/watch/" + el.dataset.id;
+    const p = S.postCache.get(el.dataset.id);
+    try {
+      if (navigator.share && !App.isDesktop()) { await navigator.share({ title: p ? p.title || "LokaChat" : "LokaChat", url }); return; }
+      await navigator.clipboard.writeText(url); toast("Link copied");
+    } catch (e) { if (e && e.name !== "AbortError") toast("Couldn't copy the link", "err"); }
+  };
   App.actions["delete-post"] = async (el) => {
     if (!(await confirmBox("Delete this post?", "It will be removed permanently.", "Delete", true))) return;
     await App.busy(el, async () => {
       await api.del("/posts/" + el.dataset.id);
       S.postCache.delete(el.dataset.id);
-      storyCache.at = 0;
-      App.closeAllModals();
+      App.cacheDrop("feed:", "stories", "mine:", "profile:", "history");
+      App.closeAllModals(); App.closeDrawers();
       toast("Deleted");
-      App.route();
+      if (S.route === "watch") App.go("/home"); else { if (App.paintFeed) App.paintFeed(); if (App.refreshYou) App.refreshYou(); }
     });
   };
 
-  async function openPostById(id, username) {
-    let p = S.postCache.get(id);
-    if (!p) {
-      const { posts } = await api.get("/posts/feed?tab=user&limit=60&username=" + encodeURIComponent(username));
-      remember(posts); p = S.postCache.get(id);
-    }
-    if (p) openPost(p); else toast("That post is no longer available", "err");
-  }
-
-  // ============================================================ Home
-  App.routes.home = async (ctx) => {
-    const v = ctx.view;
-    v.innerHTML = `<div class="page"><div class="story-bar" id="story-bar"></div>
-      <div class="tabs"><button data-action="home-tab" data-tab="recommended" class="${S.homeTab === "recommended" ? "on" : ""}">Recommended</button>
-      <button data-action="home-tab" data-tab="following" class="${S.homeTab === "following" ? "on" : ""}">Following</button></div>
-      <div id="feed"><div class="spinner"></div></div></div>`;
-    App.loadStories().then((groups) => {
-      if (ctx.stale()) return;
-      $("#story-bar").innerHTML = App.storyItemsHtml(groups, true);
-    }).catch(() => { if (!ctx.stale()) $("#story-bar").innerHTML = App.storyItemsHtml([], true); });
-    const { posts } = await api.get("/posts/feed?tab=" + S.homeTab);
-    if (ctx.stale()) return;
-    remember(posts);
-    $("#feed").innerHTML = posts.length
-      ? `<div class="grid">${posts.map(vcard).join("")}</div>`
-      : emptyBox("play", S.homeTab === "following" ? "Nothing from people you follow yet" : "No videos yet",
-        S.homeTab === "following" ? "Follow people from Search to fill this feed." : "Be the first - upload a video or photo.",
-        `<a class="btn primary" href="#/${S.homeTab === "following" ? "search" : "post"}">${S.homeTab === "following" ? "Find people" : "Upload"}</a>`);
+  // ---------- hover-to-preview (muted live preview inside the thumbnail) ----------
+  let hov = null, hovTimer = 0;
+  const stopPreview = () => {
+    clearTimeout(hovTimer);
+    if (!hov) return;
+    const v = hov.querySelector("video.prev");
+    if (v) { v.pause(); try { v.currentTime = 0; } catch (e) { /* ignore */ } v.remove(); }
+    hov.classList.remove("previewing"); hov = null;
   };
-  App.actions["home-tab"] = (el) => { S.homeTab = el.dataset.tab; App.route(); };
+  document.addEventListener("mouseover", (e) => {
+    if (!window.matchMedia("(hover: hover)").matches) return;
+    const t = e.target.closest && e.target.closest(".thumb[data-prev]");
+    if (t === hov) return;
+    stopPreview();
+    if (!t) return;
+    hov = t;
+    hovTimer = setTimeout(() => {
+      if (hov !== t) return;
+      const v = document.createElement("video");
+      v.className = "prev"; v.muted = true; v.loop = true; v.playsInline = true; v.preload = "metadata"; v.src = t.dataset.prev;
+      t.appendChild(v);
+      v.play().then(() => t.classList.add("previewing")).catch(() => v.remove());
+    }, 250);
+  });
+  document.addEventListener("mouseout", (e) => { if (hov && !hov.contains(e.relatedTarget)) stopPreview(); });
 
-  // ============================================================ Clips
-  App.routes.clips = async (ctx) => {
-    const { posts } = await api.get("/posts/feed?tab=clips&limit=30");
-    if (ctx.stale()) return;
-    remember(posts);
-    if (!posts.length) {
-      ctx.view.innerHTML = `<div class="page">${emptyBox("clips", "No clips yet", "Short vertical videos appear here.", `<a class="btn primary" href="#/post" data-action="clip-preset">Post a clip</a>`)}</div>`;
+  // ============================================================ Home hub
+  const TABS = [["recommended", "Recommended"], ["following", "Following"], ["community", "Community Posts"]];
+  const PILLS = [["all", "All"], ["video", "Videos"], ["photo", "Photos"], ["clip", "Reels"], ["popular", "Popular"], ["new", "Newest"]];
+  const feedUrl = (tab) => "/posts/feed?limit=40&tab=" + tab;
+  const loadFeed = (tab, force) => App.swr("feed:" + tab, async () => App.remember((await api.get(feedUrl(tab))).posts), () => { if (S.homeTab === tab && S.route === "home") App.paintFeed(); }, { force, fresh: 30000 });
+  App.prefetchHome = () => { ["recommended", "following", "community"].forEach((t) => loadFeed(t).catch(() => {})); App.loadStories().catch(() => {}); };
+
+  const applyPill = (posts) => {
+    const pill = S.homePill;
+    if (pill === "all") return posts;
+    if (pill === "popular") return posts.slice().sort((a, b) => (b.views || 0) - (a.views || 0));
+    if (pill === "new") return posts.slice().sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    return posts.filter((p) => p.type === pill);
+  };
+  App.paintFeed = () => {
+    const box = $("#feed"); if (!box) return;
+    const tab = S.homeTab, posts = App.cacheGet("feed:" + tab);
+    $$("#home-tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
+    $("#home-pills").hidden = tab === "community";
+    $$("#home-pills button").forEach((b) => b.classList.toggle("on", b.dataset.pill === S.homePill));
+    if (!posts) { box.innerHTML = '<div class="spinner"></div>'; return; }
+    stopPreview();
+    const list = tab === "community" ? posts : applyPill(posts);
+    if (tab === "community") {
+      box.innerHTML = `<div class="community">${list.length ? list.map(ccard).join("") : App.emptyBox("users", "No community posts yet", "Share an update, a poll idea or a photo with your followers.", `<button class="btn primary" data-action="create-type" data-type="community">Write a post</button>`)}</div>`;
       return;
     }
-    ctx.view.innerHTML = `<div class="clips-wrap">${posts.map((p) => `<section class="clip" data-id="${esc(p.id)}">
-      <video data-src="${esc(p.media_url)}" ${p.poster_url ? `poster="${esc(p.poster_url)}"` : ""} loop playsinline preload="none"></video>
-      <div class="clip-side">${likeBtn(p)}<button class="chip-btn" data-action="open-profile" data-user="${esc(p.author.username)}">${avatar(p.author, "s")}</button></div>
-      <div class="clip-ui"><b>${esc(p.author.display_name)}</b><div>${esc(p.title)}</div>
-        ${p.caption ? `<div class="muted small">${esc(p.caption)}</div>` : ""}</div></section>`).join("")}</div>`;
-    const counted = new Set();
-    const io = new IntersectionObserver((entries) => {
-      entries.forEach((en) => {
-        const vid = en.target.querySelector("video");
-        if (en.isIntersecting && en.intersectionRatio >= 0.6) {
-          if (!vid.src) vid.src = vid.dataset.src;
-          vid.play().catch(() => {});
-          const id = en.target.dataset.id;
-          if (!counted.has(id)) { counted.add(id); api.post("/posts/view", { post_id: id }).catch(() => {}); }
-        } else vid.pause();
-      });
-    }, { threshold: [0, 0.6] });
-    $$(".clip", ctx.view).forEach((c) => {
-      io.observe(c);
-      c.querySelector("video").addEventListener("click", (e) => { const v = e.target; v.paused ? v.play().catch(() => {}) : v.pause(); });
-    });
-    App.onLeave(() => { io.disconnect(); $$("video", ctx.view).forEach((v) => v.pause()); });
+    box.innerHTML = list.length ? `<div class="grid">${list.map(vcard).join("")}</div>`
+      : App.emptyBox("play", tab === "following" ? "Nothing from people you follow yet" : "No videos here yet",
+        tab === "following" ? "Follow people from Search to fill this feed." : "Be the first - upload a video or photo.",
+        `<a class="btn primary" href="#/${tab === "following" ? "search" : "post"}">${tab === "following" ? "Find people" : "Upload"}</a>`);
   };
-  App.actions["clip-preset"] = () => { S.postPreset = "clip"; App.go("/post"); };
+  App.routes.home = {
+    mount(pane) {
+      pane.innerHTML = `<div class="page"><div class="story-bar hscroll" id="story-bar"></div>
+        <div class="sticky-tabs"><div class="subtabs hscroll" id="home-tabs">${TABS.map(([k, l]) => `<button data-action="home-tab" data-tab="${k}">${l}</button>`).join("")}</div>
+        <div class="pills hscroll" id="home-pills">${PILLS.map(([k, l]) => `<button data-action="home-pill" data-pill="${k}">${l}</button>`).join("")}</div></div>
+        <div id="feed"></div></div>`;
+    },
+    async show(ctx) {
+      const paintStories = (groups) => { const b = $("#story-bar"); if (b) b.innerHTML = App.storyItemsHtml(groups, true); };
+      const cs = App.cacheGet("stories"); paintStories(cs || []);
+      App.loadStories().then((g) => { if (!ctx.stale()) paintStories(g); }).catch(() => {});
+      App.paintFeed();
+      await loadFeed(S.homeTab);
+      if (!ctx.stale()) App.paintFeed();
+    },
+  };
+  App.actions["home-tab"] = (el) => { S.homeTab = el.dataset.tab; App.paintFeed(); loadFeed(S.homeTab).catch(fail); };
+  App.actions["home-pill"] = (el) => { S.homePill = el.dataset.pill; App.paintFeed(); };
 
-  // ============================================================ Post (upload)
-  const TYPES = [["video", "Video"], ["clip", "Clip"], ["photo", "Photo"], ["story", "24h Story"]];
-  const accept = (t) => (t === "photo" ? "image/*" : t === "story" ? "image/*,video/*" : "video/*");
+  // ============================================================ Create
+  const TYPES = [["video", "Video"], ["clip", "Reel"], ["photo", "Photo"], ["story", "Story"], ["community", "Community"]];
+  const accept = (t) => (t === "photo" || t === "community" ? "image/*" : t === "story" ? "image/*,video/*" : "video/*");
+  const HINT = { story: "Stories are visible to your followers for 24 hours.", clip: "Reels are public short vertical videos.", community: "Community posts appear in the Community tab. An image is optional.", video: "", photo: "" };
+  App.actions["create-type"] = (el) => { S.postPreset = el.dataset.type; App.closeMenus(); App.go("/post"); };
 
-  App.routes.post = async (ctx) => {
-    const t = S.postPreset || "video";
-    ctx.view.innerHTML = `<div class="page" style="max-width:560px"><div class="page-head"><h2>Create</h2></div>
-      <form class="card section" data-form="post" id="post-form" style="display:grid;gap:14px">
-        <div class="tabs" style="margin:0" id="type-tabs">${TYPES.map(([k, l]) => `<button type="button" data-action="post-type" data-type="${k}" class="${k === t ? "on" : ""}">${l}</button>`).join("")}</div>
-        <input type="hidden" name="type" value="${t}">
-        <div class="field"><label>File (max 50 MB)</label><input type="file" name="file" accept="${accept(t)}" required id="post-file"></div>
-        <div id="post-preview"></div>
-        <div class="field" id="f-title" ${t === "story" ? "hidden" : ""}><label>Title</label><input name="title" maxlength="100" placeholder="Give it a title" ${t === "story" ? "" : "required"}></div>
-        <div class="field"><label>${t === "story" ? "Caption (optional)" : "Description (optional)"}</label><textarea name="caption" maxlength="500"></textarea></div>
-        <div class="field" id="f-vis" ${t === "clip" || t === "story" ? "hidden" : ""}><label>Who can see it</label>
-          <select name="visibility"><option value="public">Everyone</option><option value="followers">Followers only</option></select></div>
-        <p class="muted small" id="post-hint">${t === "story" ? "Stories are visible to your followers for 24 hours." : t === "clip" ? "Clips are public short videos." : ""}</p>
-        <button class="btn primary block" type="submit">Publish</button></form></div>`;
-    $("#post-file").addEventListener("change", (e) => {
-      const f = e.target.files[0], box = $("#post-preview");
-      if (!f) { box.innerHTML = ""; return; }
-      if (f.size > MAX_BYTES) { toast("That file is over 50 MB", "err"); e.target.value = ""; box.innerHTML = ""; return; }
-      const url = URL.createObjectURL(f);
-      box.innerHTML = f.type.startsWith("video/") ? `<video src="${url}" controls muted style="width:100%;max-height:260px;border-radius:12px;background:#000"></video>`
-        : `<img src="${url}" alt="" style="width:100%;max-height:260px;object-fit:contain;border-radius:12px;background:#000">`;
-    });
+  App.routes.post = {
+    fresh: true,
+    mount(pane) {
+      const t = S.postPreset || "video", needFile = t !== "community";
+      pane.innerHTML = `<div class="page narrow"><div class="page-head"><h2>Create</h2></div>
+        <form class="card section" data-form="post" id="post-form" style="display:grid;gap:14px">
+          <div class="tabs hscroll" style="margin:0">${TYPES.map(([k, l]) => `<button type="button" data-action="post-type" data-type="${k}" class="${k === t ? "on" : ""}">${l}</button>`).join("")}</div>
+          <input type="hidden" name="type" value="${t}">
+          <div class="field"><label>${t === "community" ? "Image (optional)" : "File (max 50 MB)"}</label><input type="file" name="file" accept="${accept(t)}" ${needFile ? "required" : ""} id="post-file"></div>
+          <div id="post-preview"></div>
+          ${t === "story" ? "" : `<div class="field"><label>${t === "community" ? "Headline (optional)" : "Title"}</label><input name="title" maxlength="100" placeholder="${t === "community" ? "Add a headline" : "Give it a title"}" ${t === "community" ? "" : "required"}></div>`}
+          <div class="field"><label>${t === "story" ? "Caption (optional)" : t === "community" ? "What's on your mind?" : "Description (optional)"}</label><textarea name="caption" maxlength="${t === "community" ? 1000 : 500}" ${t === "community" ? "required" : ""}></textarea></div>
+          ${t === "clip" ? `<div class="field"><label>Audio / music tag (optional)</label><input name="music" maxlength="80" placeholder="e.g. Original audio - song name"></div>` : ""}
+          ${t === "clip" || t === "story" ? "" : `<div class="field"><label>Who can see it</label><select name="visibility"><option value="public">Everyone</option><option value="followers">Followers only</option></select></div>`}
+          <p class="muted small">${HINT[t]}</p>
+          <button class="btn primary block" type="submit">Publish</button></form></div>`;
+      $("#post-file", pane).addEventListener("change", (e) => {
+        const f = e.target.files[0], box = $("#post-preview", pane);
+        if (!f) { box.innerHTML = ""; return; }
+        if (f.size > MAX_BYTES) { toast("That file is over 50 MB", "err"); e.target.value = ""; box.innerHTML = ""; return; }
+        const url = URL.createObjectURL(f);
+        box.innerHTML = f.type.startsWith("video/") ? `<video src="${url}" controls muted style="width:100%;max-height:260px;border-radius:12px;background:#000"></video>`
+          : `<img src="${url}" alt="" style="width:100%;max-height:260px;object-fit:contain;border-radius:12px;background:#000">`;
+      });
+    },
   };
   App.actions["post-type"] = (el) => { S.postPreset = el.dataset.type; App.route(); };
 
@@ -322,103 +363,117 @@
   const extOf = (file) => (file.name.split(".").pop() || file.type.split("/")[1] || "bin").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 5) || "bin";
 
   App.forms.post = async (form, data) => {
-    const file = $("#post-file").files[0];
-    if (!file) throw new Error("Choose a file first");
-    if (file.size > MAX_BYTES) throw new Error("That file is over 50 MB");
-    const type = data.type;
+    const file = $("#post-file").files[0], type = data.type;
+    if (type !== "community" && !file) throw new Error("Choose a file first");
+    if (file && file.size > MAX_BYTES) throw new Error("That file is over 50 MB");
     if ((type === "video" || type === "clip") && !file.type.startsWith("video/")) throw new Error("Please choose a video file");
-    if (type === "photo" && !file.type.startsWith("image/")) throw new Error("Please choose an image");
+    if ((type === "photo" || type === "community") && file && !file.type.startsWith("image/")) throw new Error("Please choose an image");
     const btn = form.querySelector("button[type=submit]");
     btn.textContent = "Uploading...";
-    const id = crypto.randomUUID(), base = `${S.user.id}/${id}`;
-    const uploaded = [];
+    const id = crypto.randomUUID(), base = `${S.user.id}/${id}`, uploaded = [];
+    let post;
     try {
-      let duration = 0, poster = null;
-      if (file.type.startsWith("video/")) ({ duration, poster } = await probeVideo(file));
-      const mediaPath = `${base}/media.${extOf(file)}`;
-      await api.upload(mediaPath, file); uploaded.push(mediaPath);
-      let posterPath = null;
-      if (poster) { posterPath = `${base}/poster.jpg`; await api.upload(posterPath, new File([poster], "poster.jpg", { type: "image/jpeg" })); uploaded.push(posterPath); }
-      await api.post("/posts/create", {
+      let duration = 0, poster = null, mediaPath = null, posterPath = null;
+      if (file) {
+        if (file.type.startsWith("video/")) ({ duration, poster } = await probeVideo(file));
+        mediaPath = `${base}/media.${extOf(file)}`;
+        await api.upload(mediaPath, file); uploaded.push(mediaPath);
+        if (poster) { posterPath = `${base}/poster.jpg`; await api.upload(posterPath, new File([poster], "poster.jpg", { type: "image/jpeg" })); uploaded.push(posterPath); }
+      }
+      post = await api.post("/posts/create", {
         type, title: (data.title || "").trim(), caption: (data.caption || "").trim(), visibility: data.visibility || "public",
-        media_path: mediaPath, poster_path: posterPath, mime: file.type || "application/octet-stream",
-        duration: Math.round(duration * 10) / 10, size: file.size,
+        media_path: mediaPath, poster_path: posterPath, mime: file ? file.type || "application/octet-stream" : null,
+        music: (data.music || "").trim(), duration: Math.round(duration * 10) / 10, size: file ? file.size : 0,
       });
-    } catch (e) {
-      api.removeFiles(uploaded);
-      btn.textContent = "Publish";
-      throw e;
-    }
-    storyCache.at = 0;
+    } catch (e) { api.removeFiles(uploaded); btn.textContent = "Publish"; throw e; }
+    const [p] = App.remember([post]);
+    App.cacheDrop("stories", "mine:", "profile:");
+    // show it immediately in the cached feeds, then refresh in the background
+    const prepend = (key) => { const c = App.cacheGet(key); if (c && !c.some((x) => x.id === p.id)) c.unshift(p); };
+    if (type === "community") { prepend("feed:community"); prepend("feed:following"); }
+    else if (type !== "story") { prepend("feed:recommended"); if (type === "clip") prepend("feed:clips"); }
     toast(type === "story" ? "Story posted for 24 hours" : "Published!");
     S.postPreset = "video";
-    App.go("/home");
+    S.user.posts = (S.user.posts || 0) + 1;
+    App.go(type === "clip" ? "/reels" : type === "community" ? "/home" : "/home");
+    if (type === "community") { S.homeTab = "community"; if (App.paintFeed) App.paintFeed(); }
   };
 
   // ============================================================ Search
-  const followBtn = (u) => u.is_me ? "" : `<button class="btn sm ${u.is_following ? "" : "primary"}" data-action="follow" data-user="${esc(u.username)}" data-following="${u.is_following ? 1 : 0}">${u.is_following ? "Following" : "Follow"}</button>`;
-  App.followBtn = followBtn;
-
-  App.actions.follow = async (el, ev) => {
-    ev.stopPropagation();
-    const now = el.dataset.following !== "1";
-    await App.busy(el, async () => {
-      await api.post("/users/follow", { username: el.dataset.user, follow: now });
-      $$(`[data-action="follow"][data-user="${el.dataset.user}"]`).forEach((b) => {
-        b.dataset.following = now ? "1" : "0"; b.textContent = now ? "Following" : "Follow"; b.classList.toggle("primary", !now);
-      });
-      storyCache.at = 0;
-    });
+  App.routes.search = {
+    mount(pane) {
+      pane.innerHTML = `<div class="page narrow"><div class="page-head"><h2>Search</h2></div>
+        <input id="q" type="search" placeholder="Search people and videos" autocomplete="off">
+        <div id="results" style="margin-top:18px"><div class="empty">${icon("search")}<h3>Find people and videos</h3><p>Type at least 2 characters.</p></div></div></div>`;
+      const input = $("#q", pane);
+      let seq = 0;
+      input.addEventListener("input", App.debounce(async () => {
+        const q = input.value.trim(), my = ++seq;
+        if (q.length < 2) return;
+        try {
+          const [u, p] = await Promise.all([api.get("/users/search?q=" + encodeURIComponent(q)), api.get("/posts/feed?tab=recommended&limit=24&q=" + encodeURIComponent(q))]);
+          if (my !== seq) return;
+          App.remember(p.posts);
+          $("#results", pane).innerHTML = (u.users.length ? `<h3 style="margin-bottom:8px">People</h3><div class="list-card card">${u.users.map((x) =>
+            `<div class="user-row" data-action="open-profile" data-user="${esc(x.username)}">${avatar(x, "m")}<div class="grow"><b>${esc(x.display_name)}</b><div class="muted small">@${esc(x.username)}</div></div>${App.followBtn(x)}</div>`).join("")}</div>` : "")
+            + (p.posts.length ? `<h3 style="margin:20px 0 8px">Videos & posts</h3><div class="grid">${p.posts.map(vcard).join("")}</div>` : "");
+          if (!u.users.length && !p.posts.length) $("#results", pane).innerHTML = App.emptyBox("search", "No results", `Nothing matched "${q}".`);
+        } catch (e) { fail(e); }
+      }, 300));
+    },
+    show(ctx) { if (App.isDesktop()) setTimeout(() => { const i = $("#q", ctx.pane); if (i) i.focus(); }, 30); },
   };
 
-  App.routes.search = async (ctx) => {
-    ctx.view.innerHTML = `<div class="page" style="max-width:760px"><div class="page-head"><h2>Search</h2></div>
-      <input id="q" type="search" placeholder="Search people and videos" autocomplete="off" autofocus>
-      <div id="results" style="margin-top:18px"><div class="empty">${icon("search")}<h3>Find people and videos</h3><p>Type at least 2 characters.</p></div></div></div>`;
-    const input = $("#q");
-    let seq = 0;
-    const run = App.debounce(async () => {
-      const q = input.value.trim(), my = ++seq;
-      if (q.length < 2) return;
-      try {
-        const [u, p] = await Promise.all([api.get("/users/search?q=" + encodeURIComponent(q)), api.get("/posts/feed?tab=recommended&limit=24&q=" + encodeURIComponent(q))]);
-        if (my !== seq || ctx.stale()) return;
-        remember(p.posts);
-        $("#results").innerHTML = (u.users.length ? `<h3 style="margin-bottom:8px">People</h3><div class="list-card card">${u.users.map((x) =>
-          `<div class="user-row" data-action="open-profile" data-user="${esc(x.username)}">${avatar(x, "m")}<div class="grow"><b>${esc(x.display_name)}</b><div class="muted small">@${esc(x.username)}</div></div>${followBtn(x)}</div>`).join("")}</div>` : "")
-          + (p.posts.length ? `<h3 style="margin:20px 0 8px">Videos & photos</h3><div class="grid">${p.posts.map(vcard).join("")}</div>` : "");
-        if (!u.users.length && !p.posts.length) $("#results").innerHTML = emptyBox("search", "No results", `Nothing matched "${q}".`);
-      } catch (e) { fail(e); }
-    }, 300);
-    input.addEventListener("input", run);
+  // ============================================================ Notifications drawer
+  let notifTimer = 0;
+  const setDot = (n) => {
+    ["#notif-dot", "#notif-dot-m"].forEach((id) => { const d = $(id); if (d) { d.hidden = !n; d.textContent = n > 9 ? "9+" : String(n || ""); } });
+  };
+  App.pollNotifs = async () => {
+    try { const r = await api.get("/users/notifications"); App.cacheSet("notifs", r); setDot(r.unread); return r; } catch (e) { return null; }
+  };
+  App.startNotifPolling = () => { clearInterval(notifTimer); App.pollNotifs(); notifTimer = setInterval(() => { if (!document.hidden) App.pollNotifs(); }, 45000); };
+  App.stopNotifPolling = () => { clearInterval(notifTimer); setDot(0); };
+
+  const notifText = (n) => n.type === "follow" ? "started following you"
+    : n.type === "like" ? `liked your ${n.post.type === "photo" ? "photo" : n.post.type === "community" ? "post" : n.post.type === "clip" ? "reel" : "video"}${n.post.title ? ": " + esc(n.post.title) : ""}`
+    : `commented${n.text ? ": " + esc(n.text) : ""}`;
+  App.actions["open-notifs"] = async () => {
+    const draw = (r) => {
+      const box = $("#notif-list"); if (!box) return;
+      box.innerHTML = r.items.length ? r.items.map((n) => `<div class="user-row" data-action="notif-open" data-type="${n.type}" data-user="${esc(n.user.username)}" ${n.post ? `data-id="${esc(n.post.id)}" data-ptype="${esc(n.post.type)}"` : ""}>
+        ${avatar(n.user, "m")}<div class="grow"><b>${esc(n.user.display_name)}</b> ${notifText(n)}<div class="muted small">${App.timeAgo(n.at)}</div></div>
+        ${n.post && n.post.poster_url ? `<img class="n-thumb" src="${esc(n.post.poster_url)}" alt="">` : n.type === "follow" ? App.followBtn(n.user) : ""}</div>`).join("")
+        : App.emptyBox("heart", "You're all caught up", "Likes, comments and new followers show up here.");
+    };
+    App.drawer(`<h3 class="d-title">Notifications</h3><div class="d-body" id="notif-list"><div class="spinner"></div></div>`, { cls: "notifs" });
+    const cached = App.cacheGet("notifs"); if (cached) draw(cached);
+    const r = (await App.pollNotifs()) || cached;
+    if (r) { draw(r); if (r.unread) { setDot(0); api.post("/users/notifications/seen", {}).then(() => { if (r.unread) r.unread = 0; }).catch(() => {}); } }
+  };
+  App.actions["notif-open"] = async (el) => {
+    App.closeDrawers();
+    if (el.dataset.type === "follow") { openProfile(el.dataset.user); return; }
+    try {
+      let p = S.postCache.get(el.dataset.id);
+      if (!p) [p] = App.remember([await api.get("/posts/" + el.dataset.id)]);
+      App.openPost(p);
+    } catch (e) { toast("That post is no longer available", "err"); }
   };
 
-  // ============================================================ Notifications
-  App.routes.notifications = async (ctx) => {
-    const { items } = await api.get("/users/notifications");
-    if (ctx.stale()) return;
-    ctx.view.innerHTML = `<div class="page" style="max-width:680px"><div class="page-head"><h2>Notifications</h2></div>` + (items.length
-      ? `<div class="list-card card">${items.map((n) => n.type === "follow"
-        ? `<div class="user-row" data-action="open-profile" data-user="${esc(n.user.username)}">${avatar(n.user, "m")}<div class="grow"><b>${esc(n.user.display_name)}</b> started following you<div class="muted small">${App.timeAgo(n.at)}</div></div></div>`
-        : `<div class="user-row" data-action="open-notif-post" data-id="${esc(n.post.id)}" data-user="${esc(n.user.username)}">${avatar(n.user, "m")}<div class="grow"><b>${esc(n.user.display_name)}</b> posted ${n.post.type === "photo" ? "a photo" : n.post.type === "clip" ? "a clip" : "a video"}: ${esc(n.post.title)}<div class="muted small">${App.timeAgo(n.at)}</div></div>
-          ${n.post.poster_url ? `<img src="${esc(n.post.poster_url)}" alt="" style="width:64px;height:40px;object-fit:cover;border-radius:8px">` : ""}</div>`).join("")}</div>`
-      : emptyBox("bell", "You're all caught up", "New followers and posts from people you follow show up here.")) + "</div>";
-  };
-  App.actions["open-notif-post"] = (el) => openPostById(el.dataset.id, el.dataset.user).catch(fail);
-
-  // ============================================================ Profile modal
+  // ============================================================ Profile modal (other people)
   async function openProfile(username) {
-    if (username === S.user.username) { App.closeAllModals(); App.go("/you"); return; }
+    if (username === S.user.username) { App.closeAllModals(); App.closeDrawers(); App.go("/you"); return; }
     try {
       const [u, f] = await Promise.all([api.get("/users/" + encodeURIComponent(username)), api.get("/posts/feed?tab=user&limit=24&username=" + encodeURIComponent(username))]);
-      remember(f.posts);
+      App.remember(f.posts);
+      if (u.is_following) S.following.add(u.username); else S.following.delete(u.username);
       modal(`<div class="profile-head">${avatar(u, "xl")}<div class="grow"><h3 style="padding:0">${esc(u.display_name)}</h3><div class="muted">@${esc(u.username)}</div>
-        <div class="stats"><div><b>${u.followers}</b><span class="muted small">followers</span></div><div><b>${u.following}</b><span class="muted small">following</span></div></div>
-        <div class="row">${followBtn(u)}<button class="btn sm" data-action="dm" data-user="${esc(u.username)}">Message</button></div></div></div>
+        <div class="stats"><div><b>${u.posts != null ? u.posts : f.posts.length}</b><span class="muted small">posts</span></div><div><b>${u.followers}</b><span class="muted small">followers</span></div><div><b>${u.following}</b><span class="muted small">following</span></div></div>
+        <div class="row">${App.followBtn(u)}<button class="btn sm" data-action="dm" data-user="${esc(u.username)}">Message</button></div></div></div>
         ${u.bio ? `<p style="white-space:pre-wrap">${esc(u.bio)}</p>` : ""}
-        ${f.posts.length ? `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px">${f.posts.map((p) =>
-          `<div class="vcard" data-action="open-post" data-id="${esc(p.id)}"><div class="thumb sq">${p.poster_url || p.type === "photo" ? `<img src="${esc(p.poster_url || p.media_url)}" alt="" loading="lazy">` : ""}</div></div>`).join("")}</div>`
-          : emptyBox("play", "No posts yet", "")}`, { cls: "wide", noFocus: true });
+        ${f.posts.length ? `<div class="mini-grid">${f.posts.map((p) => `<div class="vcard" data-action="open-post" data-id="${esc(p.id)}"><div class="thumb sq">${App.postThumb(p) ? `<img src="${esc(App.postThumb(p))}" alt="" loading="lazy">` : `<span class="c-ph">${esc((p.caption || p.title || "").slice(0, 60))}</span>`}</div></div>`).join("")}</div>`
+          : App.emptyBox("play", "No posts yet", "")}`, { cls: "wide", noFocus: true });
     } catch (e) { fail(e); }
   }
   App.openProfile = openProfile;

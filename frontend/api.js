@@ -42,7 +42,7 @@
     try {
       res = await fetch(base() + path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
     } catch (e) {
-      throw new ApiError("Can't reach the server. Check your connection (or that the Koyeb service is running).", 0);
+      throw new ApiError("Can't reach the server. Check your connection and try again.", 0);
     }
     let data = null;
     try { data = await res.json(); } catch (e) { /* empty body */ }
@@ -72,10 +72,10 @@
     buildClient();
   }
 
-  async function upload(path, file) {
+  async function upload(path, file, contentType) {
     if (!sb) throw new ApiError("Storage is not configured", 0);
     const { error } = await sb.storage.from(BUCKET).upload(path, file, {
-      contentType: file.type || "application/octet-stream", upsert: false, cacheControl: "3600",
+      contentType: contentType || file.type || "application/octet-stream", upsert: false, cacheControl: "3600",
     });
     if (error) throw new ApiError(error.message || "Upload failed", 0);
     return path;
@@ -95,6 +95,7 @@
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "conversation_members", filter: "user_id=eq." + userId },
         (p) => handlers.onMembership && handlers.onMembership(p.new))
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "posts" }, (p) => handlers.onPost && handlers.onPost(p.new))
+      .on("postgres_changes", { event: "*", schema: "public", table: "message_reactions" }, (p) => handlers.onReaction && handlers.onReaction(p.new || p.old))
       .subscribe((status) => handlers.onStatus && handlers.onStatus(status));
   }
   function unsubscribe() {

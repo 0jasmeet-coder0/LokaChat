@@ -1,5 +1,6 @@
 -- =====================================================================
 -- LokaChat database schema  (PostgreSQL / Supabase)
+-- v4 NOTE: after running this file, also run backend/migrations/v4.sql (comments, notes, saves, reactions, key backup).
 -- Run once:  Supabase Dashboard -> SQL Editor -> New query -> paste -> Run.
 -- Safe to re-run (uses IF NOT EXISTS / DROP POLICY IF EXISTS).
 --

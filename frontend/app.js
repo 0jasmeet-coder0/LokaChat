@@ -15,7 +15,7 @@
   App.setRailAvatar = () => { $("#rail-avatar").innerHTML = avatar(S.user, "xs"); };
 
   // ============================================================ auth gate
-  let auth = { tab: "in", stage: "form", ctx: {} }; // stage: form | otp | totp
+  let auth = { tab: "in", stage: "form", ctx: {}, pw: null }; // stage: form | otp | totp  (pw: kept in memory only, to back up / restore the E2EE key)
 
   function field(label, name, type, extra) {
     return `<div class="field"><label>${label}</label><input name="${name}" type="${type || "text"}" ${extra || ""} required></div>`;
@@ -50,19 +50,21 @@
         <p class="muted small center" style="margin:0">We'll send a 6-digit code to verify it's you.</p></form>`;
     }
   }
-  App.actions["auth-tab"] = (el) => { auth = { tab: el.dataset.tab, stage: "form", ctx: {} }; renderAuth(); };
-  App.actions["auth-back"] = () => { auth = { tab: auth.tab, stage: "form", ctx: {} }; renderAuth(); };
+  App.actions["auth-tab"] = (el) => { auth = { tab: el.dataset.tab, stage: "form", ctx: {}, pw: null }; renderAuth(); };
+  App.actions["auth-back"] = () => { auth = { tab: auth.tab, stage: "form", ctx: {}, pw: null }; renderAuth(); };
 
   const gotoOtp = (res, extra) => { auth.stage = "otp"; auth.ctx = { ...extra, destination: res.destination, expires_in: res.expires_in, dev_otp: res.dev_otp }; renderAuth(); };
   const fail = (e) => renderAuth(e.message || "Something went wrong");
 
   App.forms.signup = async (form, data) => {
+    auth.pw = data.password;
     try {
       const res = await api.post("/auth/signup", { username: data.username.trim(), contact: data.contact.trim(), display_name: data.display_name.trim(), password: data.password }, { auth: false });
       gotoOtp(res, { identifier: res.username, kind: "signup" });
     } catch (e) { fail(e); }
   };
   App.forms.login = async (form, data) => {
+    auth.pw = data.password;
     try {
       const res = await api.post("/auth/login", { identifier: data.identifier.trim(), password: data.password }, { auth: false });
       if (res.step === "totp") { auth.stage = "totp"; auth.ctx = { mfa_token: res.mfa_token }; renderAuth(); }
@@ -92,59 +94,139 @@
 
   // ============================================================ session
   async function startSession(res) {
+    const pw = auth.pw; auth.pw = null;
     api.setToken(res.token);
-    await enterApp(res.user);
+    await enterApp(res.user, pw);
   }
 
-  async function syncIdentity(user) {
+  // ---------- E2EE identity: restore-or-create so every device ends up with the SAME key ----------
+  const serverPub = (user) => { try { return user.public_key ? JSON.parse(user.public_key) : null; } catch (e) { return null; } };
+  async function saveKeysToServer(privJwk, password) {
+    const backup = await C.backupIdentity(privJwk, password);
+    const rec = await C.storeIdentity(S.user.id, privJwk, true);
+    await api.put("/users/me/key", { public_key: JSON.stringify(rec.publicJwk), key_backup: backup });
+    S.user.public_key = JSON.stringify(rec.publicJwk); S.user.key_backup = backup;
+    S.identity = rec;
+    return rec;
+  }
+  /** Returns "ok" | "need-password" | "no-keys". `pw` is the password just typed at sign-in (or null on a restored session). */
+  async function syncIdentity(user, pw) {
     try {
-      const id = await C.ensureIdentity(user.id);
-      S.identity = id;
-      let server = null;
-      try { server = user.public_key ? JSON.parse(user.public_key) : null; } catch (e) { /* ignore */ }
-      if (!server || server.x !== id.publicJwk.x || server.y !== id.publicJwk.y) {
-        await api.put("/users/me/key", { public_key: JSON.stringify(id.publicJwk) });
-        if (server) toast("New device: older encrypted chats can only be read on the device that created them.", "err");
+      const local = await C.loadIdentity(user.id), sp = serverPub(user);
+      if (local && (!sp || C.samePub(sp, local.publicJwk))) {
+        S.identity = local;
+        if (!sp) await api.put("/users/me/key", { public_key: JSON.stringify(local.publicJwk) });
+        return "ok";
       }
+      // this device has no key (new device) or its key no longer matches the account's key
+      if (user.key_backup) {
+        if (!pw) return "need-password";
+        try {
+          const jwk = await C.restoreIdentity(user.key_backup, pw);
+          S.identity = await C.storeIdentity(user.id, jwk, true);
+          return "ok";
+        } catch (e) { return "need-password"; }
+      }
+      // account has no backup yet
+      if (!sp && pw) { await saveKeysToServer(await C.generateIdentityJwk(), pw); return "ok"; }   // brand-new account
+      if (local) {                                    // legacy (v3) local-only key: keep using it; Security > Encryption keys can create a backed-up one
+        S.identity = local;
+        await api.put("/users/me/key", { public_key: JSON.stringify(local.publicJwk) });
+        return "ok";
+      }
+      return pw ? (await saveKeysToServer(await C.generateIdentityJwk(), pw), "ok") : "need-password";
     } catch (e) {
-      S.identity = null; // e.g. IndexedDB blocked in private mode - chat creation will explain
+      S.identity = null; // e.g. IndexedDB blocked in private mode
+      App.keyError = App.errText(e);
+      return "no-keys";
     }
   }
+  App.syncIdentity = syncIdentity;
 
-  async function enterApp(user) {
+  /** Modal asking for the account password to restore (or create) this device's encryption key. */
+  App.promptRestoreKeys = () => {
+    const hasBackup = !!S.user.key_backup;
+    App.modal(`<h3>${hasBackup ? "Restore your encryption keys" : "Set up encryption"}</h3>
+      <p class="muted small">${hasBackup ? "Enter your LokaChat password to unlock your encrypted chats on this device. Your key is stored encrypted with your password; the server can't read it." : "Enter your password to create encryption keys for this device. They are backed up encrypted with your password."}</p>
+      <form data-form="restore-keys"><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div>
+      <div class="modal-actions"><button class="btn" type="button" data-action="close-modal">Not now</button><button class="btn primary" type="submit">${hasBackup ? "Restore" : "Continue"}</button></div></form>`);
+  };
+  App.actions["restore-keys"] = () => App.promptRestoreKeys();
+  App.forms["restore-keys"] = async (form, data) => {
+    if (S.user.key_backup) {
+      let jwk;
+      try { jwk = await C.restoreIdentity(S.user.key_backup, data.password); } catch (e) { throw new Error("That password doesn't unlock your key backup"); }
+      S.identity = await C.storeIdentity(S.user.id, jwk, true);
+      const pub = JSON.stringify(S.identity.publicJwk);
+      if (!serverPub(S.user) || !C.samePub(serverPub(S.user), S.identity.publicJwk)) { await api.put("/users/me/key", { public_key: pub }); S.user.public_key = pub; }
+    } else await saveKeysToServer(await C.generateIdentityJwk(), data.password);
+    App.closeAllModals(); toast("Encryption keys ready");
+    if (App.refreshChats) await App.refreshChats();
+  };
+  App.actions["reset-keys"] = async () => {
+    if (!(await App.confirm("Create new encryption keys?", "Chats created with your old keys can't be opened afterwards. New chats work normally on every device.", "Create new keys", true))) return;
+    App.modal(`<h3>Confirm with your password</h3><form data-form="reset-keys"><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div>
+      <div class="modal-actions"><button class="btn danger" type="submit">Create new keys</button></div></form>`, { cls: "stack2" });
+  };
+  App.forms["reset-keys"] = async (form, data) => {
+    await saveKeysToServer(await C.generateIdentityJwk(), data.password);
+    form.closest(".modal-back").remove(); toast("New encryption keys created and backed up");
+    if (App.refreshChats) await App.refreshChats();
+  };
+
+  async function enterApp(user, pw) {
     S.user = user;
     show("#app");
     App.applyPin();
     App.setRailAvatar();
-    await syncIdentity(user);
+    document.body.classList.add("in-app");
+    // paint the shell first (instant), then do the slower key + data work
+    if (!location.hash || location.hash === "#") location.hash = "#/home";
+    App.route();
+    const state = await syncIdentity(user, pw);
     api.subscribe(user.id, {
       onMessage: (m) => App.chatRealtime.onMessage(m),
       onMembership: () => App.chatRealtime.onMembership(),
-      onPost: (p) => { if (p.author_id !== S.user.id && App.parseHash().name === "home") toast("New posts are available - reload the feed"); },
+      onReaction: (r) => App.chatRealtime.onReaction(r),
+      onPost: (p) => { if (p.author_id !== S.user.id) { App.cacheDrop("feed:recommended", "feed:clips"); } },
     });
-    App.loadChats().then(() => App.updateBadge()).catch(() => {});
-    if (!location.hash || location.hash === "#") location.hash = "#/home";
-    App.route();
+    // prefetch everything so tab switches never wait on the network
+    api.get("/users/following").then((r) => { S.following = new Set(r.users.map((u) => u.username)); }).catch(() => {});
+    App.prefetchHome(); if (App.prefetchReels) App.prefetchReels();
+    App.loadChats().catch(() => {}); App.loadNotes().catch(() => {});
+    App.startNotifPolling();
+    if (state === "need-password") App.promptRestoreKeys();
+    else if (state === "no-keys") toast("Encryption isn't available in this browser mode: " + (App.keyError || "storage blocked"), "err");
   }
 
   function logout(message) {
     api.unsubscribe();
     api.setToken(null);
+    App.stopNotifPolling();
     if (App.lockVault) App.lockVault();
     if (App.resetChat) App.resetChat();
-    App.closeAllModals();
-    Object.assign(S, { user: null, identity: null, chats: [], unread: {} });
+    App.closeAllModals(); App.closeDrawers();
+    Object.assign(S, { user: null, identity: null, chats: [], unread: {}, cache: {}, following: new Set(), route: null });
     S.postCache.clear();
+    $("#view").innerHTML = "";
+    document.body.classList.remove("in-app");
     location.hash = "";
-    auth = { tab: "in", stage: "form", ctx: {} };
+    auth = { tab: "in", stage: "form", ctx: {}, pw: null };
     show("#auth");
     renderAuth();
     if (message) toast(message, "err");
   }
-  App.actions.logout = async (el) => {
+  App.actions.logout = async () => {
     if (await App.confirm("Log out?", "You'll need your password and a code to sign back in.", "Log out", true)) logout();
   };
   api.onUnauthorized(() => { if (S.user) logout("Your session expired - please sign in again."); });
+
+  // ---------- header / shell wiring ----------
+  App.onRouted = (name) => {
+    const pill = $("#msg-pill-wrap");
+    if (pill) pill.classList.toggle("gone", name === "messages");
+    App.closeMenus();
+  };
 
   // ============================================================ boot
   async function boot() {
@@ -171,7 +253,7 @@
     if (next === "setup") {
       $("#setup-missing").innerHTML = missing.map((m) => `<li>${esc(m)}</li>`).join("");
       show("#setup");
-    } else if (next === "app") await enterApp(user);
+    } else if (next === "app") await enterApp(user, null);
     else { show("#auth"); renderAuth(); if (err) toast(err, "err"); }
   }
 

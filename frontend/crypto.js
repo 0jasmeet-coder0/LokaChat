@@ -1,6 +1,7 @@
 /* =====================================================================
    LokaChat - crypto.js   (WebCrypto only, no dependencies)
-   - E2EE identity: per-user ECDH P-256 key pair kept in IndexedDB
+   - E2EE identity: per-user ECDH P-256 key pair kept in IndexedDB (non-extractable) + a password-encrypted
+     backup stored on the server (users.key_backup) so every device can restore the SAME key
    - Chat keys: random AES-256-GCM key, wrapped per member with ECDH + HKDF
    - Message encryption: AES-256-GCM
    - Local vault: PBKDF2 -> AES-GCM sealed JSON
@@ -49,17 +50,41 @@
     });
   }
 
-  /** Returns { privateKey, publicJwk, created } - generating a new pair on first use on this device. */
-  async function ensureIdentity(userId) {
-    const k = "identity:" + userId;
-    const saved = await idbGet(k);
-    if (saved && saved.privateKey && saved.publicJwk) return { ...saved, created: false };
-    const pair = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
-    const publicJwk = await subtle.exportKey("jwk", pair.publicKey);
-    const rec = { privateKey: pair.privateKey, publicJwk: { kty: publicJwk.kty, crv: publicJwk.crv, x: publicJwk.x, y: publicJwk.y } };
-    await idbSet(k, rec);
-    return { ...rec, created: true };
+  // ---------- identity (ECDH P-256) ----------
+  const ECDH = { name: "ECDH", namedCurve: "P-256" };
+  const pubOf = (j) => ({ kty: j.kty, crv: j.crv, x: j.x, y: j.y });
+  const samePub = (a, b) => !!(a && b && a.x === b.x && a.y === b.y);
+
+  /** The identity saved on this device, or null. { privateKey (non-extractable), publicJwk, backedUp } */
+  async function loadIdentity(userId) {
+    const saved = await idbGet("identity:" + userId);
+    return saved && saved.privateKey && saved.publicJwk ? saved : null;
   }
+  /** Import a private JWK as a NON-extractable key and persist it on this device. */
+  async function storeIdentity(userId, privateJwk, backedUp) {
+    const privateKey = await subtle.importKey("jwk", { ...privateJwk, key_ops: ["deriveBits"], ext: true }, ECDH, false, ["deriveBits"]);
+    const rec = { privateKey, publicJwk: pubOf(privateJwk), backedUp: !!backedUp };
+    await idbSet("identity:" + userId, rec);
+    return rec;
+  }
+  /** Fresh key pair as JWKs (extractable only long enough to build the password-encrypted backup). */
+  async function generateIdentityJwk() {
+    const pair = await subtle.generateKey(ECDH, true, ["deriveBits"]);
+    return await subtle.exportKey("jwk", pair.privateKey);
+  }
+  /** Password-encrypted backup of the private key (PBKDF2 250k -> AES-GCM). Returns a JSON string for users.key_backup. */
+  async function backupIdentity(privateJwk, password) {
+    const v = await vaultCreate(password, { d: privateJwk });
+    return JSON.stringify({ v: 1, ...v.blob });
+  }
+  /** Decrypt a backup. Throws on a wrong password. Returns the private JWK. */
+  async function restoreIdentity(backupStr, password) {
+    const blob = JSON.parse(backupStr);
+    const o = await vaultOpen(password, blob);
+    if (!o.data || !o.data.d) throw new Error("Backup is corrupted");
+    return o.data.d;
+  }
+  async function clearIdentity(userId) { await idbSet("identity:" + userId, null); }
 
   // ---------- chat keys ----------
   async function newChatKeyRaw() {
@@ -76,19 +101,26 @@
       { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: enc.encode("lokachat-chat-key-wrap-v1") },
       hk, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
   }
-  /** Wrap raw chat key for a recipient. Returns base64(iv || ciphertext). */
-  async function wrapChatKey(raw, myPrivate, theirPublicJwk) {
+  /** Wrap the raw chat key for a recipient. The wrapper's PUBLIC key is embedded so the recipient never has to guess
+      which key wrapped it (a changed wrapper key can no longer break old chats). Returns a JSON string. */
+  async function wrapChatKey(raw, myPrivate, theirPublicJwk, myPublicJwk) {
     const k = await wrapKeyFor(myPrivate, theirPublicJwk);
     const iv = rand(12);
     const ct = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv }, k, raw));
     const out = new Uint8Array(12 + ct.length);
     out.set(iv); out.set(ct, 12);
-    return b64(out);
+    return JSON.stringify({ p: pubOf(myPublicJwk), w: b64(out) });
   }
-  /** Unwrap a chat key that `wrapperPublicJwk`'s owner wrapped for me. */
-  async function unwrapChatKey(wrapped, myPrivate, wrapperPublicJwk) {
-    const k = await wrapKeyFor(myPrivate, wrapperPublicJwk);
-    const bytes = unb64(wrapped);
+  /** Unwrap a chat key. Understands the v4 JSON format and the legacy base64 format (needs fallbackWrapperJwk). */
+  async function unwrapChatKey(wrapped, myPrivate, fallbackWrapperJwk) {
+    let wrapperJwk = fallbackWrapperJwk, data = wrapped;
+    if (typeof wrapped === "string" && wrapped.charAt(0) === "{") {
+      const o = JSON.parse(wrapped);
+      wrapperJwk = o.p; data = o.w;
+    }
+    if (!wrapperJwk) throw new Error("Missing wrapper key");
+    const k = await wrapKeyFor(myPrivate, wrapperJwk);
+    const bytes = unb64(data);
     const raw = await subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12) }, k, bytes.slice(12));
     return importChatKey(new Uint8Array(raw));
   }
@@ -102,6 +134,19 @@
   async function decryptText(key, ciphertext, iv) {
     const pt = await subtle.decrypt({ name: "AES-GCM", iv: unb64(iv) }, key, unb64(ciphertext));
     return dec.decode(pt);
+  }
+
+  /** Attachments: iv (12 bytes) || ciphertext, as raw bytes. */
+  async function encryptBytes(key, buf) {
+    const iv = rand(12);
+    const ct = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv }, key, buf));
+    const out = new Uint8Array(12 + ct.length);
+    out.set(iv); out.set(ct, 12);
+    return out;
+  }
+  async function decryptBytes(key, buf) {
+    const bytes = new Uint8Array(buf);
+    return subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12) }, key, bytes.slice(12));
   }
 
   // ---------- local vault (sealed with a passphrase) ----------
@@ -176,7 +221,7 @@
   }
 
   window.LokaCrypto = {
-    ensureIdentity, newChatKeyRaw, importChatKey, wrapChatKey, unwrapChatKey,
-    encryptText, decryptText, vaultCreate, vaultOpen, sealJson, totp, parseOtpauth, base32ToBytes,
+    loadIdentity, storeIdentity, generateIdentityJwk, backupIdentity, restoreIdentity, clearIdentity, samePub, pubOf,
+    newChatKeyRaw, importChatKey, wrapChatKey, unwrapChatKey, encryptText, decryptText, encryptBytes, decryptBytes, vaultCreate, vaultOpen, sealJson, totp, parseOtpauth, base32ToBytes,
   };
 })();
