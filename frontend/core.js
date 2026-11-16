@@ -9,7 +9,7 @@
   "use strict";
   const App = (window.App = {
     S: {
-      user: null, identity: null, chats: [], unread: {}, pw: null,
+      user: null, chats: [], unread: {}, pw: null,
       cache: {},                 // key -> { data, at }   (feeds, stories, notes, profiles, comments, history ...)
       postCache: new Map(),      // post id -> canonical post object (mutated by optimistic updates)
       following: new Set(),      // usernames I follow

@@ -6,7 +6,7 @@
 (function () {
   "use strict";
   const { S, $, esc, icon, avatar, toast } = App;
-  const api = window.LokaApi, C = window.LokaCrypto;
+  const api = window.LokaApi;
 
   // ============================================================ screens
   const show = (id) => {
@@ -15,7 +15,7 @@
   App.setRailAvatar = () => { $("#rail-avatar").innerHTML = avatar(S.user, "xs"); };
 
   // ============================================================ auth gate
-  let auth = { tab: "in", stage: "form", ctx: {}, pw: null }; // stage: form | otp | totp  (pw: kept in memory only, to back up / restore the E2EE key)
+  let auth = { tab: "in", stage: "form", ctx: {}, pw: null }; // stage: form | otp | totp
 
   function field(label, name, type, extra) {
     return `<div class="field"><label>${label}</label><input name="${name}" type="${type || "text"}" ${extra || ""} required></div>`;
@@ -94,65 +94,20 @@
 
   // ============================================================ session
   async function startSession(res) {
-    const pw = auth.pw; auth.pw = null;
+    auth.pw = null;
     api.setToken(res.token);
-    await enterApp(res.user, pw);
+    await enterApp(res.user);
   }
 
-  // ---------- E2EE identity: restore-or-create so every device ends up with the SAME key ----------
-  const serverPub = (user) => { try { return user.public_key ? JSON.parse(user.public_key) : null; } catch (e) { return null; } };
-  async function saveKeysToServer(privJwk, password) {
-    const backup = await C.backupIdentity(privJwk, password);
-    const rec = await C.storeIdentity(S.user.id, privJwk, true);
-    await api.put("/users/me/key", { public_key: JSON.stringify(rec.publicJwk), key_backup: backup });
-    S.user.public_key = JSON.stringify(rec.publicJwk); S.user.key_backup = backup;
-    S.identity = rec;
-    return rec;
-  }
-  /** Silent key sync. Returns "ok" | "need-password" | "no-keys" (never prompts; callers just fall back). `pw` is the password just typed at sign-in (or null on a restored session). */
-  async function syncIdentity(user, pw) {
-    try {
-      const local = await C.loadIdentity(user.id), sp = serverPub(user);
-      if (local && (!sp || C.samePub(sp, local.publicJwk))) {
-        S.identity = local;
-        if (!sp) await api.put("/users/me/key", { public_key: JSON.stringify(local.publicJwk) });
-        return "ok";
-      }
-      // this device has no key (new device) or its key no longer matches the account's key
-      if (user.key_backup) {
-        if (!pw) return "need-password";
-        try {
-          const jwk = await C.restoreIdentity(user.key_backup, pw);
-          S.identity = await C.storeIdentity(user.id, jwk, true);
-          return "ok";
-        } catch (e) { return "need-password"; }
-      }
-      // account has no backup yet
-      if (!sp && pw) { await saveKeysToServer(await C.generateIdentityJwk(), pw); return "ok"; }   // brand-new account
-      if (local) {                                    // legacy (v3) local-only key: keep using it; Security > Encryption keys can create a backed-up one
-        S.identity = local;
-        await api.put("/users/me/key", { public_key: JSON.stringify(local.publicJwk) });
-        return "ok";
-      }
-      return pw ? (await saveKeysToServer(await C.generateIdentityJwk(), pw), "ok") : "need-password";
-    } catch (e) {
-      S.identity = null; // e.g. IndexedDB blocked in private mode
-      App.keyError = App.errText(e);
-      return "no-keys";
-    }
-  }
-  App.syncIdentity = syncIdentity;
-
-  async function enterApp(user, pw) {
+  async function enterApp(user) {
     S.user = user;
     show("#app");
     App.applyPin();
     App.setRailAvatar();
     document.body.classList.add("in-app");
-    // paint the shell first (instant), then do the slower key + data work
+    // paint the shell first (instant), then load the data
     if (!location.hash || location.hash === "#") location.hash = "#/home";
     App.route();
-    const state = await syncIdentity(user, pw);
     api.subscribe(user.id, {
       onMessage: (m) => App.chatRealtime.onMessage(m),
       onMembership: () => App.chatRealtime.onMembership(),
@@ -164,8 +119,6 @@
     App.prefetchHome(); if (App.prefetchReels) App.prefetchReels();
     App.loadChats().catch(() => {}); App.loadNotes().catch(() => {});
     App.startNotifPolling();
-    // keys are handled silently: if this device has none, chats use the fallback conversation key (see chat.js)
-    if (state !== "ok" && window.console) console.info("LokaChat: no device key (" + state + (App.keyError ? ": " + App.keyError : "") + ") - using fallback conversation keys");
   }
 
   function logout(message) {
@@ -175,7 +128,7 @@
     if (App.lockVault) App.lockVault();
     if (App.resetChat) App.resetChat();
     App.closeAllModals(); App.closeDrawers();
-    Object.assign(S, { user: null, identity: null, chats: [], unread: {}, cache: {}, following: new Set(), route: null });
+    Object.assign(S, { user: null, chats: [], unread: {}, cache: {}, following: new Set(), route: null });
     S.postCache.clear();
     $("#view").innerHTML = "";
     document.body.classList.remove("in-app");
@@ -223,7 +176,7 @@
     if (next === "setup") {
       $("#setup-missing").innerHTML = missing.map((m) => `<li>${esc(m)}</li>`).join("");
       show("#setup");
-    } else if (next === "app") await enterApp(user, null);
+    } else if (next === "app") await enterApp(user);
     else { show("#auth"); renderAuth(); if (err) toast(err, "err"); }
   }
 
@@ -232,6 +185,10 @@
     try {
       if (!("serviceWorker" in navigator) || (api.isNative && api.isNative())) return;
       if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") return;
+      const hadController = !!navigator.serviceWorker.controller;
+      let reloaded = false;
+      // a new service worker (new app version) just took over: reload once so the page runs the fresh JS
+      navigator.serviceWorker.addEventListener("controllerchange", () => { if (hadController && !reloaded) { reloaded = true; location.reload(); } });
       window.addEventListener("load", () => navigator.serviceWorker.register("service-worker.js").catch(() => {}));
     } catch (e) { /* ignore */ }
   }

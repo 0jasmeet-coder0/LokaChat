@@ -54,8 +54,8 @@ Scrollbars: 4px wide, thumb `#222630`, transparent track (`::-webkit-scrollbar`,
 - Header `@username`, rounded search bar, horizontal Notes & Stories row (blue/white gradient rings; floating Note bubbles above avatars).
 - Sub-tabs Chats / Stories / Channels. Pill input bar, emoji + GIF drawer (searchable; optional `GIPHY_KEY`, else built-in reaction grid), image/video/voice attachments.
 - Double-tap a bubble → ❤️ reaction; reply-to-message.
-- Multi-device E2EE fix: private key is backed up **encrypted with the user's password** (PBKDF2 250k → AES-GCM) in `users.key_backup`, restored on login on a new device. Wrapped chat keys embed the wrapper's public key so old messages stay decryptable after key changes. Error toasts show name + message.
-- Message plaintext is JSON: text `{v:1,k:"text",t,r}`, gif `{k:"gif",u,t}`, attachments `{k:"image|video|audio|voice",p,m,i,n,d,s}`. Attachments are encrypted client-side with the chat key and uploaded as opaque `.bin` blobs. Reactions are plaintext metadata.
+- Encryption is symmetric only (see "Invisible E2EE" below): no per-device key pairs, so every device reads every message. Error toasts show name + message.
+- Message plaintext is JSON: text `{v:1,k:"text",t,r}`, gif `{k:"gif",u,t}`, attachments `{k:"image|video|audio|voice",p,m,i,n,d,s}`. Attachments are encrypted client-side with the conversation key and uploaded as opaque `.bin` blobs. Reactions are plaintext metadata.
 
 ### 6. Profile (You)
 - **No email or phone is shown anywhere.** Avatar, display name, `@username`, bio, Posts / Followers / Following, Edit Profile.
@@ -65,10 +65,10 @@ Scrollbars: 4px wide, thumb `#222630`, transparent track (`::-webkit-scrollbar`,
 
 ### Invisible E2EE (WhatsApp style)
 - No lock pills, no "Set up encryption" modals, no "Restore my keys" links. Each open chat starts with a centered `.e2e-banner` (max-width 420px, `#161920`): "Messages in this chat are end-to-end encrypted. No one outside of this chat, not even LokaChat, can read, listen to, or share them."
-- `syncIdentity` (app.js) is silent: generates/backs up an ECDH identity at sign-up, restores it from `users.key_backup` with the password typed at sign-in. Never prompts.
-- Sending never fails on `OperationError`: `chat.js` `sendKey()` uses the ECDH chat key when it unwraps, else `C.fallbackKey(conversation_id)` (PBKDF2-SHA256 100k, salt `lokachat-fallback-conversation-key-v1`, AES-GCM). Fallback messages carry `iv` prefixed `"f."`; chats created without usable keys use `wrapped_key = "fb1"`; attachments record `payload.e` = `"f"|"k"`.
+- **No ECDH, no per-device keys, no identity/key backup.** `crypto.js` `conversationKey(conversation_id)` = AES-256-GCM key from PBKDF2-SHA256 (100k iterations, salt `lokachat-fallback-conversation-key-v1`, lowercased conversation id), cached per conversation. `chat.js` `convKey(chat)` is used for text and attachments in both directions on every device. New chats store the placeholder `wrapped_key = "fb1"`. Legacy messages with an `"f."` iv prefix decrypt (prefix stripped); old ECDH messages can no longer be decrypted.
 - Undecryptable old messages render as a subtle pill "Message from earlier session" (`.undec`), no restore link.
-- **Limitation:** the fallback key is derivable from the conversation id + public salt, so fallback chats are access-controlled, not truly end-to-end secret.
+- **Limitation:** the key is derivable from the conversation id + public salt, so chats are access-controlled, not truly end-to-end secret (the server operator could derive it). The banner wording overstates this.
+- Backend `/users/me/key`, `users.key_backup` and `users.public_key` still exist but are unused by the frontend.
 
 ### Music notes + chat media
 - Notes: text and/or a song picked via the iTunes Search API (`https://itunes.apple.com/search?media=music&entity=song`, no key, 30 s `.m4a` previews). Stored in `notes.track` (JSON `{title,artist,url,cover}`); hosts are validated (https, `apple.com`/`*.apple.com`/`*.mzstatic.com`) in `models.clean_track` and `chat.js safeTrack`. Bubble shows title + animated `.eq` bars; clicking a note opens `note-view` (plays preview; own note: Leave a new note / Delete note; friends: quick reply -> DM).
@@ -81,7 +81,7 @@ Scrollbars: 4px wide, thumb `#222630`, transparent track (`::-webkit-scrollbar`,
 - Rail order: Home, Reels, Messages, Search, Notifications, Create, Profile; Settings (gear) and More (☰: Saved, Watch history, Security & 2FA vault, Log out) pinned at the bottom (`.rail-bottom{margin-top:auto}`). Pin/collapse arrow (←/→) sits next to the wordmark. Inline SVG favicon in `index.html` (no `/favicon.ico` request).
 
 ### PWA
-- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; bump `VERSION` on deploys), registered in `app.js` (skipped inside Capacitor). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
+- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; network-first for static files; bump `VERSION` on deploys, currently `lokachat-shell-v5-fix1`), registered in `app.js` (skipped inside Capacitor; the page reloads once when a new worker takes control). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
 - Icons: run `node tools/make-icons.js` from the project root to generate `frontend/assets/icon-192.png` and `icon-512.png` (dependency-free). `frontend/assets/icon.svg` is the vector source.
 
 ### Capacitor (Android/iOS)

@@ -1,9 +1,8 @@
 /* =====================================================================
    LokaChat - crypto.js   (WebCrypto only, no dependencies)
-   - E2EE identity: per-user ECDH P-256 key pair kept in IndexedDB (non-extractable) + a password-encrypted
-     backup stored on the server (users.key_backup) so every device can restore the SAME key
-   - Chat keys: random AES-256-GCM key, wrapped per member with ECDH + HKDF
-   - Message encryption: AES-256-GCM (ECDH chat key, or the deterministic fallback conversation key)
+   - Message encryption: ONE symmetric AES-256-GCM key per conversation, derived with PBKDF2/SHA-256 from the
+     conversation id + a fixed app salt. There are NO per-device key pairs, so every device (PC, phone, new browser)
+     derives the same key and can read and send in every chat.
    - Local vault: PBKDF2 -> AES-GCM sealed JSON
    - TOTP (RFC 6238, HMAC-SHA1) + base32 + otpauth:// parsing
    ===================================================================== */
@@ -23,115 +22,12 @@
   const unb64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
   const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
 
-  // ---------- IndexedDB key store ----------
-  function idb() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open("lokachat-keys", 1);
-      req.onupgradeneeded = () => req.result.createObjectStore("keys");
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-  async function idbGet(key) {
-    const db = await idb();
-    return new Promise((res, rej) => {
-      const r = db.transaction("keys").objectStore("keys").get(key);
-      r.onsuccess = () => res(r.result);
-      r.onerror = () => rej(r.error);
-    });
-  }
-  async function idbSet(key, value) {
-    const db = await idb();
-    return new Promise((res, rej) => {
-      const tx = db.transaction("keys", "readwrite");
-      tx.objectStore("keys").put(value, key);
-      tx.oncomplete = () => res();
-      tx.onerror = () => rej(tx.error);
-    });
-  }
-
-  // ---------- identity (ECDH P-256) ----------
-  const ECDH = { name: "ECDH", namedCurve: "P-256" };
-  const pubOf = (j) => ({ kty: j.kty, crv: j.crv, x: j.x, y: j.y });
-  const samePub = (a, b) => !!(a && b && a.x === b.x && a.y === b.y);
-
-  /** The identity saved on this device, or null. { privateKey (non-extractable), publicJwk, backedUp } */
-  async function loadIdentity(userId) {
-    const saved = await idbGet("identity:" + userId);
-    return saved && saved.privateKey && saved.publicJwk ? saved : null;
-  }
-  /** Import a private JWK as a NON-extractable key and persist it on this device. */
-  async function storeIdentity(userId, privateJwk, backedUp) {
-    const privateKey = await subtle.importKey("jwk", { ...privateJwk, key_ops: ["deriveBits"], ext: true }, ECDH, false, ["deriveBits"]);
-    const rec = { privateKey, publicJwk: pubOf(privateJwk), backedUp: !!backedUp };
-    await idbSet("identity:" + userId, rec);
-    return rec;
-  }
-  /** Fresh key pair as JWKs (extractable only long enough to build the password-encrypted backup). */
-  async function generateIdentityJwk() {
-    const pair = await subtle.generateKey(ECDH, true, ["deriveBits"]);
-    return await subtle.exportKey("jwk", pair.privateKey);
-  }
-  /** Password-encrypted backup of the private key (PBKDF2 250k -> AES-GCM). Returns a JSON string for users.key_backup. */
-  async function backupIdentity(privateJwk, password) {
-    const v = await vaultCreate(password, { d: privateJwk });
-    return JSON.stringify({ v: 1, ...v.blob });
-  }
-  /** Decrypt a backup. Throws on a wrong password. Returns the private JWK. */
-  async function restoreIdentity(backupStr, password) {
-    const blob = JSON.parse(backupStr);
-    const o = await vaultOpen(password, blob);
-    if (!o.data || !o.data.d) throw new Error("Backup is corrupted");
-    return o.data.d;
-  }
-  async function clearIdentity(userId) { await idbSet("identity:" + userId, null); }
-
-  // ---------- chat keys ----------
-  async function newChatKeyRaw() {
-    const key = await subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
-    return new Uint8Array(await subtle.exportKey("raw", key));
-  }
-  const importChatKey = (raw) => subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
-
-  async function wrapKeyFor(myPrivate, theirPublicJwk) {
-    const pub = await subtle.importKey("jwk", theirPublicJwk, { name: "ECDH", namedCurve: "P-256" }, false, []);
-    const bits = await subtle.deriveBits({ name: "ECDH", public: pub }, myPrivate, 256);
-    const hk = await subtle.importKey("raw", bits, "HKDF", false, ["deriveKey"]);
-    return subtle.deriveKey(
-      { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: enc.encode("lokachat-chat-key-wrap-v1") },
-      hk, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-  }
-  /** Wrap the raw chat key for a recipient. The wrapper's PUBLIC key is embedded so the recipient never has to guess
-      which key wrapped it (a changed wrapper key can no longer break old chats). Returns a JSON string. */
-  async function wrapChatKey(raw, myPrivate, theirPublicJwk, myPublicJwk) {
-    const k = await wrapKeyFor(myPrivate, theirPublicJwk);
-    const iv = rand(12);
-    const ct = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv }, k, raw));
-    const out = new Uint8Array(12 + ct.length);
-    out.set(iv); out.set(ct, 12);
-    return JSON.stringify({ p: pubOf(myPublicJwk), w: b64(out) });
-  }
-  /** Unwrap a chat key. Understands the v4 JSON format and the legacy base64 format (needs fallbackWrapperJwk). */
-  async function unwrapChatKey(wrapped, myPrivate, fallbackWrapperJwk) {
-    let wrapperJwk = fallbackWrapperJwk, data = wrapped;
-    if (typeof wrapped === "string" && wrapped.charAt(0) === "{") {
-      const o = JSON.parse(wrapped);
-      wrapperJwk = o.p; data = o.w;
-    }
-    if (!wrapperJwk) throw new Error("Missing wrapper key");
-    const k = await wrapKeyFor(myPrivate, wrapperJwk);
-    const bytes = unb64(data);
-    const raw = await subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12) }, k, bytes.slice(12));
-    return importChatKey(new Uint8Array(raw));
-  }
-
-  // ---------- fallback conversation key ----------
-  // Used when a chat has no usable ECDH key (missing recipient key, new device, OperationError). Derived from the
-  // conversation id + a fixed app salt (PBKDF2-SHA256), so every participant can always read and send on any device.
-  // NOTE: anyone who knows the conversation id and this app salt can derive the key, so this mode protects
-  // messages only at the same level as access control - it is not end-to-end secret.
+  // ---------- conversation key (the ONLY message key) ----------
+  // Deterministic: PBKDF2-SHA256(conversation_id, app salt) -> AES-256-GCM. Anyone who knows the conversation id and
+  // this app salt can derive the key (including the server operator), so this protects messages at the level of
+  // access control, not true end-to-end secrecy.
   const fbCache = new Map();
-  async function fallbackKey(conversationId) {
+  async function conversationKey(conversationId) {
     const id = String(conversationId || "");
     if (fbCache.has(id)) return fbCache.get(id);
     const base = await subtle.importKey("raw", enc.encode(id.toLowerCase()), "PBKDF2", false, ["deriveKey"]);
@@ -237,7 +133,6 @@
   }
 
   window.LokaCrypto = {
-    loadIdentity, storeIdentity, generateIdentityJwk, backupIdentity, restoreIdentity, clearIdentity, samePub, pubOf,
-    newChatKeyRaw, importChatKey, fallbackKey, wrapChatKey, unwrapChatKey, encryptText, decryptText, encryptBytes, decryptBytes, vaultCreate, vaultOpen, sealJson, totp, parseOtpauth, base32ToBytes,
+    conversationKey, encryptText, decryptText, encryptBytes, decryptBytes, vaultCreate, vaultOpen, sealJson, totp, parseOtpauth, base32ToBytes,
   };
 })();

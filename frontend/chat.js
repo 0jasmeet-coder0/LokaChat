@@ -5,9 +5,9 @@
      attachments (encrypted in the browser, stored as opaque blobs), replies,
      heart reactions (double-tap), optimistic sending with retry
    - The floating bottom-right Messages pill + quick-chat popover (desktop)
-   Encryption is invisible (WhatsApp style): each chat has an AES-256-GCM key wrapped per member with ECDH+HKDF.
-   If that key is unavailable (no recipient key, new device, OperationError) the chat silently uses a deterministic
-   fallback conversation key (iv marked "f.") so sending never fails and both people can always read.
+   Encryption is invisible (WhatsApp style) and purely symmetric: every message (both directions, every device) is AES-256-GCM
+   with a key derived by PBKDF2/SHA-256 from the conversation id + app salt (crypto.js conversationKey). No per-device key pairs.
+   Messages sent by older builds may carry an "f." iv prefix (same key) - it is stripped when reading.
    Decrypted message text is JSON: {v:1,k:"text|gif|image|video|audio|voice|music",...}
    ===================================================================== */
 (function () {
@@ -42,29 +42,14 @@
   const previewOf = (pl) => ({ text: pl.t, music: "🎵 " + (pl.t || "Music"), gif: "GIF", sticker: "Sticker", image: "📷 Photo", video: "🎥 Video", audio: "🎵 Music clip", voice: "🎤 Voice message" }[pl.k] || pl.t || "");
 
   // ---------- keys + decoding ----------
-  /** The ECDH chat key, or null when this chat uses the fallback key / the key can't be unwrapped on this device. */
-  async function e2eKey(chat) {
-    if (chat.type === "channel" || !chat.wrapped_key || chat.wrapped_key === "fb1") return null;
-    if (keyCache.has(chat.id)) return keyCache.get(chat.id);
-    if (!S.identity) return null;
-    try {
-      const fallback = chat.wrapped_by && safeJson(chat.wrapped_by.public_key);
-      const key = await C.unwrapChatKey(chat.wrapped_key, S.identity.privateKey, fallback);
-      keyCache.set(chat.id, key);
-      return key;
-    } catch (e) { return null; }   // OperationError etc: never surfaced, we fall back instead
-  }
-  const fbKey = (chat) => C.fallbackKey(chat.id);
-  const isFb = (iv) => typeof iv === "string" && iv.charAt(0) === "f" && iv.charAt(1) === ".";
-  /** Key used to SEND in this chat: the ECDH key when it works, else the fallback key. */
-  async function sendKey(chat) { const k = await e2eKey(chat); return k ? { key: k, fb: false } : { key: await fbKey(chat), fb: true }; }
+  /** The one message key for a conversation (same on every device). */
+  const convKey = (chat) => C.conversationKey(chat.id);
+  const ivOf = (iv) => (typeof iv === "string" && iv.charAt(0) === "f" && iv.charAt(1) === "." ? iv.slice(2) : iv);   // legacy "f." marker
   async function decode(chat, m) {
     const base = { ...m, failed: false, reactions: m.reactions || [] };
     if (!m.encrypted) return { ...base, payload: { k: "text", t: m.ciphertext } };
     try {
-      const fb = isFb(m.iv), key = fb ? await fbKey(chat) : await e2eKey(chat);
-      if (!key) throw new Error("No key for this message");
-      return { ...base, payload: parsePayload(await C.decryptText(key, m.ciphertext, fb ? m.iv.slice(2) : m.iv)) };
+      return { ...base, payload: parsePayload(await C.decryptText(await convKey(chat), m.ciphertext, ivOf(m.iv))) };
     } catch (e) { return { ...base, payload: { k: "text", t: "" }, failed: true }; }
   }
   const previewMsg = (chat, m) => (m.sender_id === S.user.id ? "You: " : "") + (m.failed ? "Message from earlier session" : previewOf(m.payload));
@@ -406,9 +391,7 @@
           const m = (msgStore.get(chat.id) || []).find((x) => x.payload && x.payload.p === path);
           const res = await fetch(api.publicUrl(path));
           if (!res.ok) throw new Error("Attachment unavailable (" + res.status + ")");
-          const key = m && m.payload.e === "f" ? await fbKey(chat) : await e2eKey(chat);
-          if (!key) throw new Error("Attachment from an earlier session");
-          const plain = await C.decryptBytes(key, await res.arrayBuffer());
+          const plain = await C.decryptBytes(await convKey(chat), await res.arrayBuffer());
           url = URL.createObjectURL(new Blob([plain], { type: (m && m.payload.m) || "application/octet-stream" }));
           attCache.set(path, url);
         }
@@ -456,17 +439,17 @@
       let body;
       if (chat.type === "channel") body = { conversation_id: chat.id, ciphertext: tmp.payload.t, iv: "" };
       else {
-        const { key, fb } = await sendKey(chat);
+        const key = await convKey(chat);
         if (tmp.payload._file) {                                // attachment: encrypt + upload first
           const f = tmp.payload._file;
           const bytes = await C.encryptBytes(key, await f.arrayBuffer());
           const path = `${S.user.id}/chat/${uid()}.bin`;
           await api.upload(path, new Blob([bytes], { type: "application/octet-stream" }), "application/octet-stream");
-          tmp.payload = { ...tmp.payload, p: path, e: fb ? "f" : "k" }; delete tmp.payload._file;
+          tmp.payload = { ...tmp.payload, p: path }; delete tmp.payload._file;
           attCache.set(path, tmp.localUrl);
         }
         const sealed = await C.encryptText(key, JSON.stringify({ v: 1, ...tmp.payload }));
-        body = { conversation_id: chat.id, ciphertext: sealed.ciphertext, iv: fb ? "f." + sealed.iv : sealed.iv };
+        body = { conversation_id: chat.id, ciphertext: sealed.ciphertext, iv: sealed.iv };
       }
       const sent = await api.post("/chats/send", body);
       const oldId = tmp.id;
@@ -706,16 +689,8 @@
     const byName = Object.fromEntries(users.map((u) => [u.username, u]));
     const missing = names.filter((n) => !byName[n]);
     if (missing.length) throw new Error("User not found: " + missing.join(", "));
-    let members, my_wrapped_key;
-    try {
-      if (!S.identity || names.some((n) => !byName[n].public_key)) throw new Error("no key");
-      const raw = await C.newChatKeyRaw(), mine = S.identity;
-      members = await Promise.all(names.map(async (n) => ({ username: n, wrapped_key: await C.wrapChatKey(raw, mine.privateKey, JSON.parse(byName[n].public_key), mine.publicJwk) })));
-      my_wrapped_key = await C.wrapChatKey(raw, mine.privateKey, mine.publicJwk, mine.publicJwk);
-    } catch (e) {                     // missing key or OperationError: silently use the fallback conversation key
-      members = names.map((n) => ({ username: n, wrapped_key: "fb1" })); my_wrapped_key = "fb1";
-    }
-    return api.post("/chats/create", { type, title, description, members, my_wrapped_key });
+    // no per-device keys any more: the server just stores a placeholder, messages use the conversation key
+    return api.post("/chats/create", { type, title, description, members: names.map((n) => ({ username: n, wrapped_key: "fb1" })), my_wrapped_key: "fb1" });
   }
   App.forms["new-chat"] = async (form, data) => {
     const users = (data.users || "").split(/[,\s]+/).filter(Boolean);
