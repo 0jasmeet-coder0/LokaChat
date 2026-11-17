@@ -1,4 +1,4 @@
-# LokaChat — Project Spec (v5 + PWA/Capacitor)
+# LokaChat — Project Spec (v6 + PWA/Capacitor)
 
 Mobile-first, desktop-responsive social app: YouTube-style video hub, Instagram-style follows, stories, reels and notes,
 WhatsApp/Instagram-style end-to-end encrypted chat, authenticator (TOTP) vault.
@@ -24,7 +24,7 @@ Flow: browser → FastAPI (auth, OTP, 2FA, follows, posts, comments, chats). Fas
 `--text-main #FFF` · `--text-muted #8E95A5` · `--accent-blue #38BDF8`.
 Wordmark everywhere: **Loka** white + **Chat** `#38BDF8`. It **never** collapses to "LC".
 Story rings: unseen `linear-gradient(45deg,#38BDF8,#FFF,#0284C7)` with a 2px `#000` gap; seen `#2A2F3A`.
-Scrollbars: 4px wide, thumb `#222630`, transparent track (`::-webkit-scrollbar`, plus `scrollbar-width: thin`).
+Scrollbars: vertical 3px, thumb `#222630`, transparent track; horizontal scrollbars are hidden everywhere (v6).
 
 ## v4 specification
 
@@ -81,12 +81,44 @@ Scrollbars: 4px wide, thumb `#222630`, transparent track (`::-webkit-scrollbar`,
 - Rail order: Home, Reels, Messages, Search, Notifications, Create, Profile; Settings (gear) and More (☰: Saved, Watch history, Security & 2FA vault, Log out) pinned at the bottom (`.rail-bottom{margin-top:auto}`). Pin/collapse arrow (←/→) sits next to the wordmark. Inline SVG favicon in `index.html` (no `/favicon.ico` request).
 
 ### PWA
-- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; network-first for static files; bump `VERSION` on deploys, currently `lokachat-shell-v5-fix1`), registered in `app.js` (skipped inside Capacitor; the page reloads once when a new worker takes control). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
+- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; network-first for static files; bump `VERSION` on deploys, currently `lokachat-shell-v6`), registered in `app.js` (skipped inside Capacitor; the page reloads once when a new worker takes control). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
 - Icons: run `node tools/make-icons.js` from the project root to generate `frontend/assets/icon-192.png` and `icon-512.png` (dependency-free). `frontend/assets/icon.svg` is the vector source.
 
 ### Capacitor (Android/iOS)
 - `capacitor.config.json` (`appId com.lokachat.app`, `webDir frontend`) and a root `package.json`. Inside the native shell the page origin is `https://localhost`, so `api.js` uses `config.js` `MOBILE_API_URL` (full `https://<your-app>.vercel.app/api`) whenever `API_URL` is relative. The boot setup screen flags a missing `MOBILE_API_URL`. Backend CORS must allow the app origin (`ALLOWED_ORIGINS` defaults to `*`).
 - Commands: `npm install`, `npx cap add android`, `npx cap sync android`, `npx cap open android`.
+
+## v6 specification
+
+### Shell + scrolling
+- Horizontal scrollbars hidden everywhere (content still scrolls/swipes). Desktop rail: collapsed 72px shows only the arrow/menu toggle (no "LC"); expanded/pinned 240px shows **Loka**(white)**Chat**(#38BDF8) + ← arrow.
+- Mobile <768px: horizontal swipe (`v6.js`) moves Recommended → Following → Community, Chats → Stories → Channels, profile sub-tabs, then across Home → Reels → Messages → You. Swipes starting in `.hscroll`, inputs, the player, modals, stories or an open chat are ignored. You page header has a ⚙️ Settings button (`.set-mobile`: Edit profile, Privacy, Security & 2FA, 2FA Vault).
+- Mobile overhaul: safe-area padding, 44px targets, edge-to-edge cards, full-screen Reels (topbar hidden), bottom tab bar.
+
+### + Create studio (`v6.js`)
+- Menu: Upload video / Create post / Create story → modal studio (`App.openCreate`). Drag-and-drop; auto-detects 16:9 video, 9:16 reel, image post, community post; live preview, Fit/Fill, photo crop (Original/1:1/4:5/16:9, baked client-side), cover-thumbnail picker (6 frames) for videos, upload progress.
+- Toggles: **Share as 24h Story** (second `story` post from the same file) and **Promote as Sponsored Ad** (CTA Watch / Visit site / Learn more + https URL).
+- No native `<audio controls>` anywhere: `App.audioChip(url,{start,len})` is a custom play/pause pill with progress + animated equalizer (`.ap`).
+- **Music Library** (`App.musicLibrary`): iTunes Search + curated trending chips (Trending/Hindi/Pop/Hip-Hop/Chill) + ♥ Saved; album art, animated `.eq` bars; waveform clip selector (draggable 5/10/15/30 s window over the 30 s preview; real waveform when the audio can be decoded, else a seeded synthetic one). Used for Reels and Stories; picked tracks are stored in `posts.music` as JSON `{title,artist,url,cover,start,len}` and played with `App.playClip` (loops only that window). Saved audios: `liked_audios`.
+- Profile tabs: Posts · Reels · Saved · Liked Videos · Liked Reels · Saved Audios (+ Watch History carousel).
+
+### Watch page / player
+- Floating bottom-right **miniplayer** (play/pause, ✕, click to maximize) when the stage scrolls out of view after playback started (PC + mobile; sits above the bottom nav on mobile).
+- **Auto-CC**: uses real `.vtt` tracks when present, otherwise the Web Speech API + `.vp-cc` caption overlay.
+- **Adaptive resolution**: Auto / 1080p / 720p / 480p / 360p Data Saver drawn through a canvas (`App.attachScaler`) from the one stored file; Auto follows Network Information / player size. Speed 0.5×–2×.
+- Comments: `gap:14px` between Reply and Delete; GIF / sticker comments (`comments.gif_url`; GIPHY if `GIPHY_KEY` else built-in stickers); creator can 📌 Pin one top-level comment (`posts.pinned_comment_id`, shown first with a "Pinned by creator" tag) and delete any comment on their own post.
+
+### Ranking + Sponsored ads
+- Recommended/Reels/Explore: `score = (views*1 + likes*4 + comments*6 + watch_completion*5) × age decay`; Following stays chronological (`main.py rank_posts`).
+- Sponsored posts (`posts.is_sponsored, cta_label, cta_url`) are excluded from organic ranking and injected as ads: Home grid every 6th card, Reels every 5th reel, each with a **Sponsored** badge and CTA button.
+
+### Search, share, DM
+- Search tab: Instagram-style masonry grid of trending Reels & Videos before typing; instant filters All / Users / Reels / Videos / Audios.
+- Share sheet (✈): row of friends (one tap sends a `{k:"share"}` message into their E2EE chat), Copy link, WhatsApp, X, More (Web Share).
+- DM message actions (right-click on PC, 400 ms long-press on mobile): floating emoji pill (❤️ 😂 😮 😢 😡 👍 +) above the message, menu below: Reply, Forward (re-encrypts attachments for the target chat), Edit (own text; `edited_at`, "edited" label), Copy, Translate (MyMemory, only after a confirm), Pin (`conversations.pinned_message_id`, pin bar), Unsend (deletes for everyone; realtime UPDATE/DELETE). Composer has Emoji, GIF, Photo/Video, Mic.
+
+## API additions (v6)
+`POST /comments/pin` · `POST /chats/edit` · `DELETE /chats/messages/{id}` · `POST /chats/pin` · `GET /audios` · `POST /audios/toggle` · feed tabs `explore`, `liked`, `liked_reels` · `POST /posts/create` accepts `is_sponsored`, `cta_label`, `cta_url` and a JSON `music` track · `POST /posts/comment` accepts `gif_url` (body optional). Database: run `backend/migrations/v6.sql` after `v5.sql` (adds `messages` to the realtime publication and `replica identity full`).
 
 ## API additions (v5)
 `PUT /users/me/note` accepts `track` (iTunes track object) and allows song-only notes; `GET /notes` returns `track`. Database: run `backend/migrations/v5.sql` after `v4.sql`.
@@ -99,16 +131,20 @@ feed tabs `community` and `saved` · `POST /posts/create` accepts type `communit
 Database: run `backend/schema.sql`, then `backend/migrations/v4.sql`.
 
 ## Honest limitations
-- Quality selector only offers the original file (no transcoding); other options are shown unavailable. CC works only if caption tracks exist.
+- Resolution options are simulated on-device with a canvas from the single stored file: they change sharpness/CPU, **not** bandwidth. Auto-CC uses the microphone (it hears the speakers), is Chrome/Edge/Safari-only and not frame-accurate.
+- Photo crop is baked into the upload; video is never cropped (preview Fit/Fill only). Waveform falls back to a synthetic one if the audio host blocks decoding.
+- Translate sends the message text to the third-party MyMemory API (after confirmation). Pinned DM messages only update for others on their next chat-list refresh.
+- GIF search needs `GIPHY_KEY` in `config.js`; without it only built-in stickers are offered. Sponsored ads are creator-labelled (no payments/targeting).
 - Dislike is local only. Message reactions are not encrypted. Channels are plaintext.
 - In-memory rate limiter is per serverless instance.
 
 ## Frontend files (load order)
-`config.js` → `crypto.js` → `api.js` → `core.js` → `views.js` → `chat.js` → `you.js` → `app.js`.
+`config.js` → `crypto.js` → `api.js` → `core.js` → `views.js` → `watch.js` → `chat.js` → `you.js` → `v6.js` → `app.js`. `v6.js` overrides `App.routes.post/search`, `App.actions.share/create-type/add-story`; keep it after `you.js`.
 
 ## Conventions
 Modular, commented, no build step. Escape all interpolated text with `App.esc`. Use `data-action` / `data-form` delegation, not inline handlers.
 
 ## Status
+- v3–v6 implemented (v6 = this session). v6 files were only syntax-checked (`node --check`, `py_compile`); no browser or live run yet.
 - v3, v4 and v5 complete. Backend tested with pytest (fake Supabase); frontend exercised in a jsdom end-to-end run (35 checks).
 - **Not yet verified against live Supabase/Vercel, live iTunes/CORS, a real Android build, or in real browsers.**

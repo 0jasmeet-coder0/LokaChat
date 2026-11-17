@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">LokaChat</string>
+    <string name="title_activity_main">LokaChat</string>
+    <string name="package_name">com.lokachat.app</string>
+    <string name="custom_url_scheme">com.lokachat.app</string>
+</resources>

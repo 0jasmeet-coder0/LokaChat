@@ -112,6 +112,8 @@
       onMessage: (m) => App.chatRealtime.onMessage(m),
       onMembership: () => App.chatRealtime.onMembership(),
       onReaction: (r) => App.chatRealtime.onReaction(r),
+      onMessageEdit: (m) => App.chatRealtime.onEdit && App.chatRealtime.onEdit(m),
+      onMessageDelete: (m) => App.chatRealtime.onDelete && App.chatRealtime.onDelete(m),
       onPost: (p) => { if (p.author_id !== S.user.id) { App.cacheDrop("feed:recommended", "feed:clips"); } },
     });
     // prefetch everything so tab switches never wait on the network

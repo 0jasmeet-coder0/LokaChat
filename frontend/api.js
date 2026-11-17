@@ -96,6 +96,8 @@
     if (channel) { try { sb.removeChannel(channel); } catch (e) { /* ignore */ } }
     channel = sb.channel("loka-live-" + userId)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (p) => handlers.onMessage && handlers.onMessage(p.new))
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "messages" }, (p) => handlers.onMessageEdit && handlers.onMessageEdit(p.new))
+      .on("postgres_changes", { event: "DELETE", schema: "public", table: "messages" }, (p) => handlers.onMessageDelete && handlers.onMessageDelete(p.old))
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "conversation_members", filter: "user_id=eq." + userId },
         (p) => handlers.onMembership && handlers.onMembership(p.new))
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "posts" }, (p) => handlers.onPost && handlers.onPost(p.new))

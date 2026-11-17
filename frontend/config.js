@@ -14,5 +14,6 @@ window.LOKA_CONFIG = {
   SUPABASE_URL: "https://cfzucdlkalhmirorhvyi.supabase.co",
   SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNmenVjZGxrYWxobWlyb3JodnlpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ2NzEwMDYsImV4cCI6MjExMDI0NzAwNn0.8z2jZWkhVT4oJBbHVmnjw3tG8vwwfpUFD-ih_qLFEq4",
   API_URL: "/api",
+  GIPHY_KEY: "", // optional (free key from developers.giphy.com): enables GIF search in chats and comments. Empty = built-in stickers only.
   MOBILE_API_URL: "https://loka-chat.vercel.app/api", // <- paste "https://YOUR-APP.vercel.app/api" before building the Android/iOS app
 };

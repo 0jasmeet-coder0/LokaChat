@@ -10,6 +10,7 @@ Run locally:  uvicorn main:app --reload
 """
 import logging
 import os
+import random
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -461,6 +462,8 @@ def shape_posts(posts: list, user: dict) -> list:
         "comments": p.get("comments") or 0, "music": p.get("music") or "", "saved": p["id"] in saved,
         "media_url": public_url(p["media_path"]), "poster_url": public_url(p.get("poster_path")),
         "views": p.get("views") or 0, "likes": p.get("likes") or 0, "liked": p["id"] in liked,
+        "is_sponsored": bool(p.get("is_sponsored")), "cta_label": p.get("cta_label") or "", "cta_url": p.get("cta_url") or "",
+        "pinned_comment_id": p.get("pinned_comment_id"),
         "created_at": p["created_at"], "expires_at": p.get("expires_at"), "author": pub(authors.get(p["author_id"])),
     } for p in posts]
 
@@ -487,7 +490,11 @@ def create_post(body: PostCreate, user: dict = Depends(current_user)):
             raise HTTPException(400, "Stories must be a photo or video")
         if body.type != "story" and not body.title.strip():
             raise HTTPException(422, "A title is required")
+    sponsored = bool(body.is_sponsored and body.type in ("video", "clip", "photo"))   # stories / community posts can't be ads
+    if sponsored and body.cta_label == "Visit site" and not body.cta_url:
+        raise HTTPException(422, "Add the link your 'Visit site' button should open")
     row = {
+        "is_sponsored": sponsored, "cta_label": (body.cta_label or "Watch") if sponsored else "", "cta_url": body.cta_url if sponsored else "",
         "author_id": user["id"], "type": body.type, "title": body.title.strip(), "caption": body.caption.strip(),
         "visibility": "followers" if body.type == "story" else "public" if body.type == "clip" else body.visibility,
         "media_path": media, "poster_path": poster, "mime": mime or None, "duration": body.duration, "size": body.size,
@@ -498,8 +505,54 @@ def create_post(body: PostCreate, user: dict = Depends(current_user)):
     return shape_posts([created], user)[0]
 
 
+def engagement_scores(posts: list) -> dict:
+    """YouTube-style ranking: (views*1 + likes*4 + comments*6 + watch_completion*5), decayed by age.
+    watch_completion = sum over viewers of the fraction of the video they watched (from watch_history)."""
+    ids = [p["id"] for p in posts]
+    done: dict = {}
+    if ids:
+        for w in rows(table("watch_history").select("post_id,position,duration").in_("post_id", ids)):
+            d = w.get("duration") or 0
+            if d > 0:
+                done[w["post_id"]] = done.get(w["post_id"], 0.0) + min(1.0, (w.get("position") or 0) / d)
+    t, out = now(), {}
+    for p in posts:
+        hours = max(0.0, (t - parse_ts(p["created_at"])).total_seconds() / 3600)
+        raw = (p.get("views") or 0) * 1 + (p.get("likes") or 0) * 4 + (p.get("comments") or 0) * 6 + done.get(p["id"], 0.0) * 5
+        out[p["id"]] = (raw + 1) / ((hours + 2) ** 1.2)      # +1: brand-new posts with no engagement still order by freshness
+    return out
+
+
+def rank_posts(posts: list) -> list:
+    scores = engagement_scores(posts)
+    return sorted(posts, key=lambda p: scores[p["id"]], reverse=True)
+
+
+def inject_ads(items: list, ads: list, every: int) -> list:
+    """Insert a Sponsored post after every `every` organic posts (cycling through the ads). With a short feed, one ad still
+    appears at the end so advertisers always get seen."""
+    if not ads or not items:
+        return items
+    out, since, ai = [], 0, 0
+    for p in items:
+        out.append(p)
+        since += 1
+        if since >= every:
+            out.append(ads[ai % len(ads)]); ai += 1; since = 0
+    if ai == 0:
+        out.append(ads[0])
+    return out
+
+
+def sponsored_pool(types: list, exclude_ids: set, n: int = 8) -> list:
+    ads = rows(table("posts").select("*").eq("is_sponsored", True).eq("visibility", "public").in_("type", types).order("created_at", desc=True).limit(40))
+    ads = [a for a in ads if a["id"] not in exclude_ids]
+    random.shuffle(ads)
+    return ads[:n]
+
+
 @app.get("/posts/feed")
-def feed(tab: Literal["recommended", "following", "clips", "stories", "mine", "user", "community", "saved"] = "recommended",
+def feed(tab: Literal["recommended", "following", "clips", "stories", "mine", "user", "community", "saved", "explore", "liked", "liked_reels"] = "recommended",
          q: str = Query("", max_length=60), username: str = Query("", max_length=40),
          before: Optional[str] = None, limit: int = Query(30, ge=1, le=60), user: dict = Depends(current_user)):
     uid, followed = user["id"], following_ids(user["id"])
@@ -513,10 +566,25 @@ def feed(tab: Literal["recommended", "following", "clips", "stories", "mine", "u
         return qb
 
     found: list = []
-    if tab == "recommended":
-        found = rows(base().eq("visibility", "public").in_("type", ["video", "photo"]).order("created_at", desc=True).limit(limit))
-    elif tab == "clips":
-        found = rows(base().eq("visibility", "public").eq("type", "clip").order("created_at", desc=True).limit(limit))
+    if tab in ("recommended", "clips", "explore"):
+        # v6: engagement-ranked. Pull a recent window of organic posts, rank it, keep the best `limit`,
+        # then weave Sponsored posts in (Home grid: every 6 posts, Reels: every 5 reels).
+        kinds = {"recommended": ["video", "photo"], "clips": ["clip"], "explore": ["video", "clip", "photo"]}[tab]
+        window = rows(base().eq("visibility", "public").eq("is_sponsored", False).in_("type", kinds).order("created_at", desc=True).limit(max(limit * 3, 90)))
+        organic = rank_posts(window)[:limit]
+        if tab == "explore":
+            return {"posts": shape_posts(organic, user)}
+        ads = sponsored_pool(["video", "photo", "clip"] if tab == "recommended" else ["clip"], {p["id"] for p in organic})
+        if q.strip():
+            ads = []                                   # searches show only real matches
+        return {"posts": shape_posts(inject_ads(organic, ads, 6 if tab == "recommended" else 5), user)}
+    elif tab in ("liked", "liked_reels"):
+        lids = [r["post_id"] for r in rows(table("post_likes").select("post_id").eq("user_id", uid).order("created_at", desc=True).limit(150))]
+        kinds = ["clip"] if tab == "liked_reels" else ["video", "photo"]
+        found = [p for p in rows(table("posts").select("*").in_("id", lids).in_("type", kinds)) if can_view(p, user, set(followed))] if lids else []
+        order = {pid: i for i, pid in enumerate(lids)}
+        found.sort(key=lambda p: order.get(p["id"], 1e9))      # most recently liked first
+        return {"posts": shape_posts(found[:limit], user)}
     elif tab == "following":
         if followed:
             found += rows(base().in_("author_id", followed).in_("type", ["video", "photo", "clip", "community"]).order("created_at", desc=True).limit(limit))
@@ -603,7 +671,7 @@ def delete_post(post_id: str, user: dict = Depends(current_user)):
 def shape_message(m: dict) -> dict:
     return {"id": m["id"], "conversation_id": m["conversation_id"], "sender_id": m["sender_id"],
             "ciphertext": m["ciphertext"], "iv": m.get("iv") or "", "encrypted": bool(m.get("encrypted", True)),
-            "created_at": m["created_at"]}
+            "created_at": m["created_at"], "edited_at": m.get("edited_at")}
 
 
 def membership(conv_id: str, user: dict) -> dict:
@@ -634,7 +702,7 @@ def list_chats(user: dict = Depends(current_user)):
         out.append({
             "id": c["id"], "type": c["type"], "title": c.get("title") or "", "description": c.get("description") or "",
             "created_at": c["created_at"], "last_message_at": c.get("last_message_at") or c["created_at"],
-            "my_role": m["role"], "wrapped_key": m.get("wrapped_key"),
+            "pinned_message_id": c.get("pinned_message_id"), "my_role": m["role"], "wrapped_key": m.get("wrapped_key"),
             "wrapped_by": pub(people.get(m.get("wrapped_by")), key=True), "member_count": len(cm),
             "members": [{**pub(people[x["user_id"]], key=True), "role": x["role"]} for x in shown if x["user_id"] in people],
             "last_message": shape_message(last) if last else None,

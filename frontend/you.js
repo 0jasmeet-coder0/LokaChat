@@ -24,7 +24,7 @@
     mount(pane) {
       pane.innerHTML = `<div class="page profile-page"><div id="you-head"></div>
         <div class="sec-title row"><h3 class="grow">Watch history</h3></div><div class="hscroll hist" id="you-hist"></div>
-        <div class="tabs prof-tabs" id="you-tabs">${[["posts", "Posts", "image"], ["reels", "Reels", "clips"], ["saved", "Saved", "bookmark"]].map(([k, l, ic]) => `<button data-action="you-tab" data-tab="${k}">${icon(ic)}${l}</button>`).join("")}</div>
+        <div class="tabs prof-tabs hscroll" id="you-tabs">${[["posts", "Posts", "image"], ["reels", "Reels", "clips"], ["saved", "Saved", "bookmark"], ["liked", "Liked Videos", "heart"], ["likedreels", "Liked Reels", "heart"], ["audios", "Saved Audios", "music"]].map(([k, l, ic]) => `<button data-action="you-tab" data-tab="${k}">${icon(ic)}${l}</button>`).join("")}</div>
         <div id="you-grid"></div></div>`;
     },
     async show(ctx) {
@@ -41,7 +41,7 @@
   function paintHead() {
     const box = $("#you-head"); if (!box) return;
     const u = S.user;
-    box.innerHTML = `<div class="profile-head">${avatar(u, "xl")}<div class="grow"><h2>${esc(u.display_name)}</h2><div class="muted">@${esc(u.username)}</div>
+    box.innerHTML = `<div class="profile-head" style="position:relative"><button class="icon-btn set-mobile" data-action="open-settings" aria-label="Settings" style="position:absolute;top:-6px;right:-6px;z-index:2">${icon("gear")}</button>${avatar(u, "xl")}<div class="grow"><h2>${esc(u.display_name)}</h2><div class="muted">@${esc(u.username)}</div>
       <div class="stats"><div><b>${App.num(u.posts)}</b><span class="muted small">Posts</span></div><div><b>${App.num(u.followers)}</b><span class="muted small">Followers</span></div><div><b>${App.num(u.following)}</b><span class="muted small">Following</span></div></div>
       ${u.bio ? `<p class="bio">${esc(u.bio)}</p>` : ""}
       <div class="row wrap"><button class="btn sm" data-action="edit-profile">Edit Profile</button><button class="btn sm" data-action="open-security">${icon("shield")}Security & 2FA</button>
@@ -57,17 +57,33 @@
   function paintGrid() {
     $$("#you-tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === S.youTab));
     const box = $("#you-grid"); if (!box) return;
+    if (S.youTab === "audios") { paintAudios(box); return; }
     const mine = App.cacheGet("mine:all"), saved = App.cacheGet("feed:saved");
-    const src = S.youTab === "saved" ? saved : mine && (S.youTab === "reels" ? mine.filter((p) => p.type === "clip") : mine.filter((p) => ["video", "photo", "community"].includes(p.type)));
+    const src = S.youTab === "saved" ? saved : S.youTab === "liked" ? App.cacheGet("feed:liked") : S.youTab === "likedreels" ? App.cacheGet("feed:liked_reels") : mine && (S.youTab === "reels" ? mine.filter((p) => p.type === "clip") : mine.filter((p) => ["video", "photo", "community"].includes(p.type)));
     if (!src) { box.innerHTML = '<div class="spinner"></div>'; return; }
-    const none = { posts: ["image", "No posts yet", "Videos, photos and community posts you share live here.", "video"], reels: ["clips", "No reels yet", "Short vertical videos you post appear here.", "clip"], saved: ["bookmark", "Nothing saved", "Tap the bookmark on any post to keep it here.", null] }[S.youTab];
+    const none = { liked: ["heart", "No liked videos", "Videos you like show up here.", null], likedreels: ["heart", "No liked reels", "Reels you like show up here.", null], posts: ["image", "No posts yet", "Videos, photos and community posts you share live here.", "video"], reels: ["clips", "No reels yet", "Short vertical videos you post appear here.", "clip"], saved: ["bookmark", "Nothing saved", "Tap the bookmark on any post to keep it here.", null] }[S.youTab];
     box.innerHTML = src.length ? `<div class="gridp">${src.map(tile).join("")}</div>` : App.emptyBox(none[0], none[1], none[2], none[3] ? `<button class="btn primary" data-action="create-type" data-type="${none[3]}">Create</button>` : "");
   }
   function loadGrid(force) {
     App.swr("mine:all", async () => App.remember((await api.get("/posts/feed?tab=mine&limit=60")).posts), () => paintGrid(), { force, fresh: 20000 }).catch(() => {});
     App.swr("feed:saved", async () => App.remember((await api.get("/posts/feed?tab=saved&limit=60")).posts), () => paintGrid(), { force, fresh: 20000 }).catch(() => {});
+    loadTab(force);
   }
-  App.actions["you-tab"] = (el) => { S.youTab = el.dataset.tab; paintGrid(); };
+  /** Liked Videos / Liked Reels / Saved Audios load on demand. */
+  function loadTab(force) {
+    const t = { liked: "liked", likedreels: "liked_reels" }[S.youTab];
+    if (t) App.swr("feed:" + t, async () => App.remember((await api.get(`/posts/feed?tab=${t}&limit=60`)).posts), () => paintGrid(), { force, fresh: 20000 }).catch(() => {});
+    else if (S.youTab === "audios") App.loadAudios(force).then(() => { if (S.youTab === "audios") paintGrid(); }).catch(() => {});
+  }
+  function paintAudios(box) {
+    const list = App.cacheGet("audios");
+    if (!list) { box.innerHTML = '<div class="spinner"></div>'; return; }
+    box.innerHTML = list.length ? `<div class="aud-list">${list.map((t) => `<div class="aud-row card"><span class="cv">${t.cover ? `<img src="${esc(t.cover)}" alt="" loading="lazy">` : ""}</span><div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><div class="muted small ellipsis">${esc(t.artist)}</div>${App.audioChip(t.url, { label: "30s" })}</div>
+      <button type="button" class="icon-btn mlib-heart on acc" data-action="aud-save" data-title="${esc(t.title)}" data-artist="${esc(t.artist)}" data-url="${esc(t.url)}" data-cover="${esc(t.cover || "")}" aria-label="Remove from saved audios">${icon("heart")}</button></div>`).join("")}</div>`
+      : App.emptyBox("music", "No saved audios", "Tap the heart on a song in the music library to keep it here.");
+  }
+  App.paintYouAudios = () => { if (S.route === "you" && S.youTab === "audios") paintGrid(); };
+  App.actions["you-tab"] = (el) => { S.youTab = el.dataset.tab; paintGrid(); loadTab(false); };
 
   // ============================================================ profile editing
   // ---------- sidebar: Settings + More ----------
@@ -75,9 +91,15 @@
     App.closeMenus();
     modal(`<h3>Settings</h3><div class="stack">
       <button class="btn block" data-action="edit-profile">${icon("edit")}Edit profile</button>
+      <button class="btn block" data-action="open-privacy">${icon("lock")}Privacy</button>
       <button class="btn block" data-action="open-security">${icon("shield")}Security & 2FA</button>
+      <button class="btn block" data-action="more-vault">${icon("key")}2FA Vault</button>
       <button class="btn block" data-action="toggle-pin">${icon("arrow-left")}Pin / collapse sidebar</button></div>`, {});
   };
+  App.actions["open-privacy"] = () => modal(`<h3>Privacy</h3><div class="stack"><p class="muted">Your email and phone number are never shown on your profile.</p>
+    <p class="muted">Direct and group chats are end-to-end encrypted in your browser. Channels are public broadcasts and are not encrypted.</p>
+    <p class="muted">Posts set to "Followers only" are hidden from everyone else. Dislikes are private and stay on this device.</p>
+    <div class="modal-actions"><button class="btn" data-action="close-modal">Close</button></div></div>`);
   const goYou = (scroll, tab) => { App.closeMenus(); if (tab) S.youTab = tab; S.scrollTo = scroll; if (S.route === "you") { if (tab) paintGrid(); const t = $(scroll === "hist" ? "#you-hist" : "#you-tabs"); S.scrollTo = null; if (t) t.scrollIntoView({ block: "start" }); } else location.hash = "#/you"; };
   App.actions["more-saved"] = () => goYou("tabs", "saved");
   App.actions["more-history"] = () => goYou("hist");

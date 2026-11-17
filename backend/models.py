@@ -3,7 +3,7 @@ import re
 import uuid
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{3,20}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -32,6 +32,7 @@ def check_uuid(v: str) -> str:
 
 
 Code = Field(pattern=r"^\d{6}$")
+CTA_LABELS = ("Watch", "Visit site", "Learn more")
 
 
 class SignupIn(BaseModel):
@@ -123,9 +124,36 @@ class PostCreate(BaseModel):
     media_path: Optional[str] = Field(default=None, min_length=3, max_length=300)
     poster_path: Optional[str] = Field(default=None, max_length=300)
     mime: Optional[str] = Field(default=None, max_length=100)
-    music: str = Field(default="", max_length=80)
+    music: str = Field(default="", max_length=800)
     duration: float = Field(default=0, ge=0, le=86400)
     size: int = Field(default=0, ge=0)
+    is_sponsored: bool = False                                  # v6: creator promotes this upload as a Sponsored ad
+    cta_label: str = Field(default="", max_length=24)           # v6: Watch / Visit site / Learn more
+    cta_url: str = Field(default="", max_length=400)            # v6: https link for the CTA button (optional for 'Watch')
+
+    @field_validator("music")
+    @classmethod
+    def _music(cls, v): return clean_music(v)
+
+    @field_validator("cta_label")
+    @classmethod
+    def _cta_label(cls, v):
+        v = (v or "").strip()
+        if v and v not in CTA_LABELS:
+            raise ValueError("Button must be Watch, Visit site or Learn more")
+        return v
+
+    @field_validator("cta_url")
+    @classmethod
+    def _cta_url(cls, v):
+        v = (v or "").strip()
+        if not v:
+            return ""
+        from urllib.parse import urlparse
+        u = urlparse(v)
+        if u.scheme != "https" or not u.hostname or "." not in u.hostname:
+            raise ValueError("Ad links must be https:// URLs")
+        return v
 
 
 class LikeIn(BaseModel):
@@ -170,10 +198,39 @@ class SendIn(BaseModel):
     def _id(cls, v): return check_uuid(v)
 
 
+def clean_gif(v) -> str:
+    """A comment GIF is an https GIPHY/Tenor URL, or a built-in sticker written as 'sticker:<emoji>'. '' = none."""
+    v = (v or "").strip()
+    if not v:
+        return ""
+    if v.startswith("sticker:"):
+        if not 0 < len(v) - 8 <= 12:
+            raise ValueError("Invalid sticker")
+        return v
+    from urllib.parse import urlparse
+    u = urlparse(v)
+    host = (u.hostname or "").lower()
+    ok = u.scheme == "https" and any(host == d or host.endswith("." + d) for d in ("giphy.com", "tenor.com", "tenor.googleapis.com"))
+    if not ok or len(v) > 400:
+        raise ValueError("Unsupported GIF link")
+    return v
+
+
 class CommentIn(BaseModel):
     post_id: str
-    body: str = Field(min_length=1, max_length=500)
+    body: str = Field(default="", max_length=500)
     parent_id: Optional[str] = None
+    gif_url: str = Field(default="", max_length=420)   # v6: GIF / sticker comment
+
+    @field_validator("gif_url")
+    @classmethod
+    def _gif(cls, v): return clean_gif(v)
+
+    @model_validator(mode="after")
+    def _non_empty(self):
+        if not self.body.strip() and not self.gif_url:
+            raise ValueError("Write a comment or pick a GIF")
+        return self
 
     @field_validator("post_id")
     @classmethod
@@ -221,7 +278,29 @@ def clean_track(t) -> Optional[dict]:
     if not title:
         raise ValueError("Track needs a title")
     cover = str(t.get("cover") or "")
-    return {"title": title, "artist": artist, "url": _safe_media_url(t.get("url")), "cover": _safe_media_url(cover) if cover else ""}
+    out = {"title": title, "artist": artist, "url": _safe_media_url(t.get("url")), "cover": _safe_media_url(cover) if cover else ""}
+    # v6: the part of the 30 s preview the user picked in the clip selector (seconds)
+    try:
+        start, length = float(t.get("start") or 0), float(t.get("len") or 0)
+    except (TypeError, ValueError):
+        start, length = 0.0, 0.0
+    if length > 0:
+        out["start"] = round(min(max(start, 0.0), 30.0), 1)
+        out["len"] = round(min(max(length, 3.0), 30.0), 1)
+    return out
+
+
+def clean_music(v: str) -> str:
+    """Post music tag: plain text (max 80 chars) or a JSON track {title, artist, url, cover, start, len} from the Music Library."""
+    import json
+    v = (v or "").strip()
+    if v.startswith("{"):
+        try:
+            t = clean_track(json.loads(v))
+        except (ValueError, TypeError):
+            raise ValueError("Invalid music track")
+        return json.dumps(t, separators=(",", ":"))
+    return v[:80]
 
 
 class NoteIn(BaseModel):
@@ -232,6 +311,54 @@ class NoteIn(BaseModel):
     @field_validator("track")
     @classmethod
     def _track(cls, v): return clean_track(v)
+
+
+class PinCommentIn(BaseModel):
+    comment_id: str
+
+    @field_validator("comment_id")
+    @classmethod
+    def _id(cls, v): return check_uuid(v)
+
+
+class EditMessageIn(BaseModel):
+    """Edit own message: the client re-encrypts the new text and sends the new ciphertext + iv."""
+    message_id: str
+    ciphertext: str = Field(min_length=1, max_length=12000)
+    iv: str = Field(default="", max_length=100)
+
+    @field_validator("message_id")
+    @classmethod
+    def _id(cls, v): return check_uuid(v)
+
+
+class PinMessageIn(BaseModel):
+    conversation_id: str
+    message_id: Optional[str] = None   # None / null unpins
+
+    @field_validator("conversation_id")
+    @classmethod
+    def _c(cls, v): return check_uuid(v)
+
+    @field_validator("message_id")
+    @classmethod
+    def _m(cls, v): return check_uuid(v) if v else None
+
+
+class AudioIn(BaseModel):
+    """Save / unsave a song (iTunes preview metadata) in 'Saved Audios'."""
+    title: str = Field(min_length=1, max_length=80)
+    artist: str = Field(default="", max_length=80)
+    url: str
+    cover: str = ""
+
+    @field_validator("url")
+    @classmethod
+    def _u(cls, v): return _safe_media_url(v)
+
+    @field_validator("cover")
+    @classmethod
+    def _c(cls, v): return _safe_media_url(v) if v else ""
 
 
 class ReactIn(BaseModel):

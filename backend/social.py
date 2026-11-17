@@ -8,7 +8,7 @@ from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from models import CommentIn, CommentLikeIn, NoteIn, ReactIn, SaveIn, check_uuid
+from models import AudioIn, CommentIn, CommentLikeIn, EditMessageIn, NoteIn, PinCommentIn, PinMessageIn, ReactIn, SaveIn, check_uuid
 
 
 def vid(value: str) -> str:
@@ -31,13 +31,14 @@ def build_router(h):
         return h.shape_posts([h.viewable_post(vid(post_id), user)], user)[0]
 
     # --------------------------------------------------------------- comments
-    def shape_comments(cs: list, user: dict) -> list:
+    def shape_comments(cs: list, user: dict, pinned_id=None) -> list:
         if not cs:
             return []
         authors = {u["id"]: u for u in h.rows(h.table("users").select("*").in_("id", list({c["author_id"] for c in cs})))}
         liked = {x["comment_id"] for x in h.rows(h.table("comment_likes").select("comment_id").eq("user_id", user["id"])
                                                  .in_("comment_id", [c["id"] for c in cs]))}
         return [{"id": c["id"], "post_id": c["post_id"], "parent_id": c.get("parent_id"), "body": c["body"],
+                 "gif_url": c.get("gif_url") or "", "pinned": bool(pinned_id) and c["id"] == pinned_id,
                  "likes": c.get("likes") or 0, "liked": c["id"] in liked, "created_at": c["created_at"],
                  "author": h.pub(authors.get(c["author_id"]))} for c in cs]
 
@@ -45,7 +46,10 @@ def build_router(h):
     def list_comments(post_id: str, user: dict = me):
         post = h.viewable_post(vid(post_id), user)
         cs = h.rows(h.table("comments").select("*").eq("post_id", post["id"]).order("created_at", desc=True).limit(300))
-        return {"comments": shape_comments(cs, user)}
+        pinned = post.get("pinned_comment_id")
+        shaped = shape_comments(cs, user, pinned)
+        shaped.sort(key=lambda c: not c["pinned"])        # pinned comment first (stable: newest-first otherwise)
+        return {"comments": shaped, "pinned_comment_id": pinned}
 
     @r.post("/posts/comment")
     def add_comment(body: CommentIn, user: dict = me):
@@ -57,7 +61,7 @@ def build_router(h):
             if not parent:
                 raise HTTPException(404, "Comment not found")
             parent_id = parent.get("parent_id") or parent["id"]  # one level of replies, like YouTube
-        c = h.rows(h.table("comments").insert({"post_id": post["id"], "author_id": user["id"], "parent_id": parent_id, "body": body.body.strip()}))[0]
+        c = h.rows(h.table("comments").insert({"post_id": post["id"], "author_id": user["id"], "parent_id": parent_id, "body": body.body.strip(), "gif_url": body.gif_url}))[0]
         total = count_rows("comments", "post_id", post["id"])
         h.table("posts").update({"comments": total}).eq("id", post["id"]).execute()
         return {"comment": shape_comments([c], user)[0], "comments": total}
@@ -70,11 +74,28 @@ def build_router(h):
         post = h.first(h.table("posts").select("*").eq("id", c["post_id"]))
         if user["id"] not in (c["author_id"], post and post["author_id"]):
             raise HTTPException(403, "You can't delete this comment")
+        if post and post.get("pinned_comment_id") == c["id"]:
+            h.table("posts").update({"pinned_comment_id": None}).eq("id", post["id"]).execute()
         h.table("comments").delete().eq("id", c["id"]).execute()
         h.table("comments").delete().eq("parent_id", c["id"]).execute()  # replies (also cascaded in SQL)
         total = count_rows("comments", "post_id", c["post_id"])
         h.table("posts").update({"comments": total}).eq("id", c["post_id"]).execute()
         return {"deleted": True, "comments": total}
+
+    @r.post("/comments/pin")
+    def pin_comment(body: PinCommentIn, user: dict = me):
+        """Only the creator of the video / reel can pin (or unpin) a top-level comment on it."""
+        c = h.first(h.table("comments").select("*").eq("id", body.comment_id))
+        if not c:
+            raise HTTPException(404, "Comment not found")
+        post = h.first(h.table("posts").select("*").eq("id", c["post_id"]))
+        if not post or post["author_id"] != user["id"]:
+            raise HTTPException(403, "Only the creator can pin comments")
+        if c.get("parent_id"):
+            raise HTTPException(400, "Only top-level comments can be pinned")
+        now_pinned = None if post.get("pinned_comment_id") == c["id"] else c["id"]
+        h.table("posts").update({"pinned_comment_id": now_pinned}).eq("id", post["id"]).execute()
+        return {"pinned_comment_id": now_pinned}
 
     @r.post("/comments/like")
     def like_comment(body: CommentLikeIn, user: dict = me):
@@ -145,5 +166,60 @@ def build_router(h):
             "emoji": body.emoji, "updated_at": h.iso(h.now()),
         }, on_conflict="message_id,user_id").execute()
         return {"ok": True, "emoji": body.emoji}
+
+    # ------------------------------------------------- message edit / unsend / pin (v6)
+    def own_message(message_id: str, user: dict) -> dict:
+        msg = h.first(h.table("messages").select("*").eq("id", vid(message_id)))
+        if not msg:
+            raise HTTPException(404, "Message not found")
+        h.membership(msg["conversation_id"], user)
+        if msg["sender_id"] != user["id"]:
+            raise HTTPException(403, "You can only change your own messages")
+        return msg
+
+    @r.post("/chats/edit")
+    def edit_message(body: EditMessageIn, user: dict = me):
+        h.limiter.hit(f"edit:{user['id']}", 60, 60)
+        msg = own_message(body.message_id, user)
+        if msg.get("encrypted", True) and not body.iv:
+            raise HTTPException(422, "Edited messages must be end-to-end encrypted")
+        edited = h.iso(h.now())
+        h.table("messages").update({"ciphertext": body.ciphertext, "iv": body.iv if msg.get("encrypted", True) else "",
+                                    "edited_at": edited}).eq("id", msg["id"]).execute()
+        return {"id": msg["id"], "ciphertext": body.ciphertext, "iv": body.iv, "edited_at": edited}
+
+    @r.delete("/chats/messages/{message_id}")
+    def unsend_message(message_id: str, user: dict = me):
+        """Unsend = delete the message for everyone in the conversation (reactions cascade)."""
+        msg = own_message(message_id, user)
+        h.table("messages").delete().eq("id", msg["id"]).execute()
+        return {"deleted": True, "id": msg["id"], "conversation_id": msg["conversation_id"]}
+
+    @r.post("/chats/pin")
+    def pin_message(body: PinMessageIn, user: dict = me):
+        h.membership(body.conversation_id, user)
+        if body.message_id:
+            msg = h.first(h.table("messages").select("*").eq("id", body.message_id).eq("conversation_id", body.conversation_id))
+            if not msg:
+                raise HTTPException(404, "Message not found")
+        h.table("conversations").update({"pinned_message_id": body.message_id}).eq("id", body.conversation_id).execute()
+        return {"conversation_id": body.conversation_id, "pinned_message_id": body.message_id}
+
+    # ------------------------------------------------- Saved Audios + GIF favourites (v6)
+    @r.get("/audios")
+    def list_audios(user: dict = me):
+        items = h.rows(h.table("liked_audios").select("*").eq("user_id", user["id"]).order("created_at", desc=True).limit(100))
+        return {"audios": [{"title": a["title"], "artist": a.get("artist") or "", "url": a["url"], "cover": a.get("cover") or "",
+                            "created_at": a["created_at"]} for a in items]}
+
+    @r.post("/audios/toggle")
+    def toggle_audio(body: AudioIn, user: dict = me):
+        had = h.first(h.table("liked_audios").select("*").eq("user_id", user["id"]).eq("url", body.url))
+        if had:
+            h.table("liked_audios").delete().eq("id", had["id"]).execute()
+        else:
+            h.table("liked_audios").insert({"user_id": user["id"], "title": body.title.strip(), "artist": body.artist.strip(),
+                                            "url": body.url, "cover": body.cover}).execute()
+        return {"saved": not had}
 
     return r

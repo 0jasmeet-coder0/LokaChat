@@ -39,7 +39,7 @@
     if (typeof text === "string" && text.charAt(0) === "{") { const o = safeJson(text); if (o && o.v === 1 && o.k) return o; }
     return { k: "text", t: text };
   };
-  const previewOf = (pl) => ({ text: pl.t, music: "🎵 " + (pl.t || "Music"), gif: "GIF", sticker: "Sticker", image: "📷 Photo", video: "🎥 Video", audio: "🎵 Music clip", voice: "🎤 Voice message" }[pl.k] || pl.t || "");
+  const previewOf = (pl) => ({ share: "\u{1F517} Shared a post", text: pl.t, music: "🎵 " + (pl.t || "Music"), gif: "GIF", sticker: "Sticker", image: "📷 Photo", video: "🎥 Video", audio: "🎵 Music clip", voice: "🎤 Voice message" }[pl.k] || pl.t || "");
 
   // ---------- keys + decoding ----------
   /** The one message key for a conversation (same on every device). */
@@ -136,7 +136,7 @@
   // ---------- music (iTunes Search API: free, no key, 30 s .m4a previews) ----------
   const okHost = (u) => { try { const x = new URL(u); const h = x.hostname.toLowerCase(); return x.protocol === "https:" && (h === "apple.com" || h.endsWith(".apple.com") || h.endsWith(".mzstatic.com")); } catch (e) { return false; } };
   /** Validates a track coming from the network (notes, messages): only https Apple preview/artwork hosts are playable. */
-  const safeTrack = (t) => (t && t.title && okHost(t.url) ? { title: String(t.title).slice(0, 80), artist: String(t.artist || "").slice(0, 80), url: t.url, cover: t.cover && okHost(t.cover) ? t.cover : "" } : null);
+  const safeTrack = (t) => (t && t.title && okHost(t.url) ? { title: String(t.title).slice(0, 80), artist: String(t.artist || "").slice(0, 80), url: t.url, cover: t.cover && okHost(t.cover) ? t.cover : "", ...(Number(t.len) > 0 ? { start: Math.max(0, Math.min(30, Number(t.start) || 0)), len: Math.max(3, Math.min(30, Number(t.len))) } : {}) } : null);
   App.safeTrack = safeTrack;
   async function itunesSearch(q) {
     const res = await fetch("https://itunes.apple.com/search?media=music&entity=song&limit=12&term=" + encodeURIComponent(q));
@@ -150,7 +150,7 @@
   function musicCard(pl) {
     const t = safeTrack({ title: pl.t, artist: pl.a, url: pl.u, cover: pl.c });
     if (!t) return `<span class="txt">🎵 ${esc(pl.t || "Music")}</span>`;
-    return `<div class="mus-card">${coverHtml(t)}<div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><div class="muted small ellipsis">${esc(t.artist)}</div><audio controls preload="none" src="${esc(t.url)}"></audio></div></div>`;
+    return `<div class="mus-card">${coverHtml(t)}<div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><div class="muted small ellipsis">${esc(t.artist)}</div>${App.audioChip(t.url, { start: t.start, len: t.len, label: "30s" })}</div></div>`;
   }
 
   let previewAudio = null, previewIdx = -1;
@@ -232,12 +232,12 @@
     const mine = n.user.id === S.user.id, t = safeTrack(n.track);
     const m = modal(`<div class="note-card">${avatar(n.user, "l")}<b>${esc(mine ? "Your note" : n.user.display_name)}</b>
       ${n.text ? `<div class="nc-text">${esc(n.text)}</div>` : ""}
-      ${t ? `<div class="trk-chip big">${coverHtml(t)}<div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><span class="muted small">${esc(t.artist)}</span></div>${eqHtml}</div><audio class="nc-audio" controls src="${esc(t.url)}"></audio>`
+      ${t ? `<div class="trk-chip big">${coverHtml(t)}<div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><span class="muted small">${esc(t.artist)}</span></div>${eqHtml}</div>${App.audioChip(t.url, { start: t.start, len: t.len, label: "30s" })}`
         : n.music ? `<div class="muted">♪ ${esc(n.music)}</div>` : ""}
       <div class="muted small">${App.timeAgo(n.created_at)}</div>
       ${mine ? `<div class="modal-actions"><button class="btn danger" data-action="note-del">Delete note</button><button class="btn primary" data-action="note-new">Leave a new note</button></div>`
-        : `<form data-form="note-reply" data-user="${esc(n.user.username)}"><div class="row"><input name="text" maxlength="500" placeholder="Reply to ${esc(n.user.display_name)}'s note..." autocomplete="off" required><button class="btn primary sm" type="submit">Send message</button></div></form>`}</div>`, { onClose: () => { const a = $(".nc-audio"); if (a) a.pause(); } });
-    const a = $(".nc-audio", m.el); if (a) a.play().catch(() => {});
+        : `<form data-form="note-reply" data-user="${esc(n.user.username)}"><div class="row"><input name="text" maxlength="500" placeholder="Reply to ${esc(n.user.display_name)}'s note..." autocomplete="off" required><button class="btn primary sm" type="submit">Send message</button></div></form>`}</div>`, { onClose: () => { if (App.stopChip) App.stopChip(); } });
+    const ab = $(".ap-b", m.el); if (ab) ab.click();
   };
   App.actions["note-new"] = () => { App.closeAllModals(); App.actions["note-menu"](); };
   App.forms["note-reply"] = async (form, data) => {
@@ -317,7 +317,7 @@
 
   // ---------- conversation ----------
   function openConv(chat, ctx) {
-    openId = chat.id; replyTo = null;
+    openId = chat.id; replyTo = null; editing = null; closeCtx();
     S.unread[chat.id] = 0; App.updateBadge();
     const conv = $("#conv");
     conv.dataset.theme = getTheme(chat.id);
@@ -331,7 +331,7 @@
     paintList();
     const cached = msgStore.get(chat.id);
     if (cached) paintMessages(chat, cached); else $("#msgs").innerHTML = '<div class="spinner"></div>';
-    wireSwipe(chat);
+    wireSwipe(chat); wireCtx(chat);
     loadMessages(chat).then((list) => { if (openId === chat.id) paintMessages(chat, list); })
       .catch((e) => { if (openId === chat.id && !cached) $("#msgs").innerHTML = `<div class="conv-empty"><div>${esc(App.errText(e))}<br><button class="btn" data-action="reload-view">Try again</button></div></div>`; });
     if (App.isDesktop()) { const inp = $(".composer input[name=text]"); if (inp) inp.focus(); }
@@ -341,7 +341,7 @@
     return `<form class="composer ig" data-form="send" data-id="${esc(chat.id)}" id="composer">
       <div class="pill-input">${e2e ? `<button type="button" class="ci" data-action="pick-toggle" aria-label="Emoji and GIFs">${icon("smile")}</button>` : ""}
       <input name="text" placeholder="${e2e ? "Message..." : "Broadcast to subscribers"}" autocomplete="off" maxlength="4000">
-      ${e2e ? `<span class="c-tools att-wrap"><button type="button" class="ci" data-action="att-menu" aria-label="Attach">${icon("add")}</button><button type="button" class="ci" data-action="rec-toggle" aria-label="Voice message">${icon("mic")}</button></span>` : ""}
+      ${e2e ? `<span class="c-tools att-wrap"><button type="button" class="ci" data-action="attach" aria-label="Photo or video">${icon("image")}</button><button type="button" class="ci gifb" data-action="pick-gif" aria-label="GIF">GIF</button><button type="button" class="ci" data-action="att-menu" aria-label="Attach">${icon("add")}</button><button type="button" class="ci" data-action="rec-toggle" aria-label="Voice message">${icon("mic")}</button></span>` : ""}
       <button class="ci send" type="submit" aria-label="Send">${icon("send")}</button>
       ${e2e ? `<div class="att-menu" id="att-menu" hidden><button type="button" data-action="attach">${icon("image")}<span>Photo or video</span></button><button type="button" data-action="pick-music">${icon("music")}<span>Music</span></button><button type="button" data-action="pick-gif">${icon("smile")}<span>GIF or sticker</span></button></div>` : ""}</div>
       ${e2e ? `<input type="file" id="att-file" accept="image/*,video/*" hidden>` : ""}</form>`;
@@ -357,7 +357,7 @@
   };
   const mediaTag = (k, url, pl) => k === "image" ? `<img class="att-img" src="${esc(url)}" alt="${esc(pl.n || "Photo")}" loading="lazy">`
     : k === "video" ? `<video class="att-vid" src="${esc(url)}" controls playsinline preload="metadata"></video>`
-    : `<div class="att-aud">${k === "voice" ? "🎤 Voice message" : "🎵 " + esc(pl.n || "Music clip")}<audio src="${esc(url)}" controls preload="metadata"></audio></div>`;
+    : `<div class="att-aud">${k === "voice" ? "🎤 Voice message" : "🎵 " + esc(pl.n || "Music clip")}${App.audioChip(url, { label: pl.d ? App.dur(pl.d) : "" })}</div>`;
   const reactHtml = (m) => {
     if (!m.reactions || !m.reactions.length) return "";
     const g = {};
@@ -370,6 +370,7 @@
     let body;
     if (m.failed) body = `<span class="undec">Message from earlier session</span>`;
     else if (pl.k === "music") body = musicCard(pl);
+    else if (pl.k === "share") body = `<div class="m-share" data-action="open-shared" data-pid="${esc(pl.pid || "")}">${pl.th && /^https:\/\//.test(pl.th) ? `<img class="att-img" src="${esc(pl.th)}" alt="" loading="lazy">` : ""}<b>${esc(pl.t || "Shared post")}</b><span class="muted small">Tap to open</span></div>`;
     else if (pl.k === "gif") body = pl.u ? `<img class="gif" src="${esc(pl.u)}" alt="${esc(pl.t || "GIF")}" loading="lazy">` : `<span class="sticker">${esc(pl.t)}</span>`;
     else if (pl.k === "image" || pl.k === "video" || pl.k === "audio" || pl.k === "voice") body = attHtml(m);
     else body = `<span class="txt">${esc(pl.t)}</span>`;
@@ -378,7 +379,7 @@
     return `<div class="mrow ${mine ? "mine" : ""} ${m.pending ? "pending" : ""}" data-mid="${esc(m.id)}">
       ${!mine && chat.type !== "direct" ? `<span class="m-av">${avatar(who, "xs")}</span>` : ""}
       <div class="bubble ${pl.k === "gif" || pl.k === "image" || pl.k === "video" ? "media" : ""} ${m.failed ? "fail" : ""}" ${m.id.startsWith("tmp-") ? "" : `data-dbl="react-heart" data-mid="${esc(m.id)}"`}>
-        ${who ? `<span class="who">${esc(who.display_name)}</span>` : ""}${reply}${body}<span class="t">${status}</span>${reactHtml(m)}</div>
+        ${who ? `<span class="who">${esc(who.display_name)}</span>` : ""}${pl.fw ? '<span class="muted small" style="display:block">↪ Forwarded</span>' : ""}${reply}${body}<span class="t">${m.edited_at ? "edited · " : ""}${status}</span>${reactHtml(m)}</div>
       ${m.id.startsWith("tmp-") ? "" : `<button class="m-reply" data-action="m-reply" data-mid="${esc(m.id)}" aria-label="Reply">${icon("reply")}</button>`}</div>`;
   }
   function hydrate(chat, scope) {
@@ -402,7 +403,7 @@
   function paintMessages(chat, list) {
     const box = $("#msgs"); if (!box || openId !== chat.id) return;
     const banner = chat.type === "channel" ? "" : `<div class="e2e-banner">${icon("lock")}<span>Messages in this chat are end-to-end encrypted. No one outside of this chat, not even LokaChat, can read, listen to, or share them.</span></div>`;
-    box.innerHTML = banner + (list.length ? list.map((m) => msgHtml(chat, m)).join("")
+    box.innerHTML = pinBarHtml(chat, list) + banner + (list.length ? list.map((m) => msgHtml(chat, m)).join("")
       : `<div class="conv-empty"><div><p>${chat.type === "channel" ? "No broadcasts yet." : "No messages yet. Say hello!"}</p></div></div>`);
     box.scrollTop = box.scrollHeight;
     hydrate(chat);
@@ -432,6 +433,7 @@
     appendMessage(chat, tmp);
     previews.set(chat.id, "You: " + previewOf(payload)); paintList();
     await transmit(chat, tmp);
+    return tmp;
   }
   async function transmit(chat, tmp) {
     tmp.pending = true; tmp.failedSend = false; repaintMsg(chat, tmp);
@@ -467,6 +469,7 @@
     const chat = find(form.dataset.id), text = (data.text || "").trim();
     if (!chat || !text) return;
     const input = form.querySelector("input[name=text]"); input.value = "";
+    if (editing) { const mid = editing; editing = null; clearReply(); await doEdit(chat, mid, text); return; }
     const payload = chat.type === "channel" ? { k: "text", t: text } : { k: "text", t: text, ...(replyTo ? { r: replyTo } : {}) };
     clearReply();
     sendPayload(chat, payload);
@@ -520,6 +523,189 @@
     react(el.dataset.mid, mineSame ? "" : el.dataset.emoji);
   };
 
+  // ---------- message actions: right-click (PC) / 400 ms long-press (mobile) ----------
+  let mctx = null, mctxAt = 0, lpT = 0, editing = null;
+  const closeCtx = () => { if (mctx) { mctx.forEach((n) => n.remove()); mctx = null; } };
+  App.closeCtx = closeCtx;
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeCtx(); });
+  window.addEventListener("resize", closeCtx);
+  const REACT_SET = ["❤️", "\u{1F602}", "\u{1F62E}", "\u{1F622}", "\u{1F621}", "\u{1F44D}"];
+  const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+  function wireCtx(chat) {
+    const box = $("#msgs"); if (!box) return;
+    const target = (e) => { const b = e.target.closest(".bubble"), row = b && b.closest(".mrow"); return row ? (msgStore.get(chat.id) || []).find((x) => x.id === row.dataset.mid) || null : null; };
+    box.addEventListener("contextmenu", (e) => {
+      if (e.target.closest("a,input,textarea")) return;
+      const m = target(e); if (!m) return;
+      e.preventDefault(); if (!mctx) openCtx(chat, m);
+    });
+    let sx = 0, sy = 0;
+    box.addEventListener("touchstart", (e) => {
+      clearTimeout(lpT);
+      if (e.touches.length !== 1) return;
+      const m = target(e); if (!m) return;
+      sx = e.touches[0].clientX; sy = e.touches[0].clientY;
+      lpT = setTimeout(() => { try { if (navigator.vibrate) navigator.vibrate(12); } catch (er) { /* ignore */ } openCtx(chat, m); }, 400);
+    }, { passive: true });
+    box.addEventListener("touchmove", (e) => { const t = e.touches[0]; if (Math.abs(t.clientX - sx) > 10 || Math.abs(t.clientY - sy) > 10) clearTimeout(lpT); }, { passive: true });
+    ["touchend", "touchcancel"].forEach((ev) => box.addEventListener(ev, () => clearTimeout(lpT), { passive: true }));
+  }
+
+  function openCtx(chat, m) {
+    closeCtx();
+    const row = $(`.mrow[data-mid="${m.id}"]`), bub = row && $(".bubble", row);
+    if (!bub || m.failed || m.id.startsWith("tmp-")) return;
+    const pl = m.payload, mine = m.sender_id === S.user.id, text = pl.k === "text" ? pl.t || "" : "", pinned = chat.pinned_message_id === m.id;
+    const myRx = (m.reactions.find((r) => r.user_id === S.user.id) || {}).emoji;
+    const items = [["reply", "reply", "Reply"], ["forward", "forward", "Forward"]];
+    if (mine && pl.k === "text" && canPost(chat)) items.push(["edit", "edit", "Edit"]);
+    if (text) items.push(["copy", "copy", "Copy"], ["translate", "translate", "Translate"]);
+    items.push(["pin", "pin", pinned ? "Unpin" : "Pin"]);
+    if (mine) items.push(["unsend", "trash", "Unsend"]);
+    const mk = (tag, cls, html) => { const n = document.createElement(tag); n.className = cls; if (html) n.innerHTML = html; return n; };
+    const back = mk("div", "mctx-back");
+    const pill = mk("div", "mctx-pill", REACT_SET.map((e) => `<button type="button" data-e="${e}" class="${e === myRx ? "mine" : ""}">${e}</button>`).join("") + '<button type="button" class="more" data-more="1" aria-label="More reactions">+</button>');
+    const menu = mk("div", "mctx-menu", items.map(([k, ic, label]) => `<button type="button" data-a="${k}" class="${k === "unsend" ? "danger-t" : ""}">${icon(ic)}${label}</button>`).join(""));
+    const clone = mk("div", `mrow ${mine ? "mine" : ""} mctx-clone`);
+    const cb = bub.cloneNode(true); cb.removeAttribute("data-dbl"); clone.appendChild(cb);
+    const r = bub.getBoundingClientRect();
+    document.body.append(back, pill, clone, menu);
+    const vw = innerWidth, vh = innerHeight, pad = 8, ph = pill.offsetHeight || 52, pw = pill.offsetWidth, mw = menu.offsetWidth, mh = menu.offsetHeight;
+    const avail = vh - pad * 2 - ph - mh - 16, ch = Math.min(r.height, Math.max(60, avail));
+    let top = Math.max(r.top, ph + pad + 8);
+    if (top + ch + 8 + mh > vh - pad) top = Math.max(ph + pad + 8, vh - pad - mh - 8 - ch);
+    Object.assign(clone.style, { left: r.left + "px", top: top + "px", width: r.width + "px", maxHeight: ch + "px", overflow: "hidden" });
+    pill.style.top = top - ph - 8 + "px"; pill.style.left = clamp(mine ? r.right - pw : r.left, pad, vw - pw - pad) + "px";
+    menu.style.top = top + ch + 8 + "px"; menu.style.left = clamp(mine ? r.right - mw : r.left, pad, vw - mw - pad) + "px";
+    mctx = [back, pill, clone, menu]; mctxAt = Date.now();
+    back.addEventListener("click", () => { if (Date.now() - mctxAt > 450) closeCtx(); });
+    back.addEventListener("contextmenu", (e) => { e.preventDefault(); if (Date.now() - mctxAt > 450) closeCtx(); });
+    pill.addEventListener("click", (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      if (b.dataset.more) {
+        const old = $(".mctx-more"); if (old) { old.remove(); return; }
+        const more = mk("div", "mctx-more", EMOJI.slice(0, 80).map(([em]) => `<button type="button" data-e="${em}">${em}</button>`).join(""));
+        document.body.appendChild(more); mctx.push(more);
+        more.style.top = Math.min(parseFloat(pill.style.top) + ph + 6, vh - 250) + "px"; more.style.left = clamp(parseFloat(pill.style.left), pad, vw - more.offsetWidth - pad) + "px";
+        more.addEventListener("click", (ev) => { const x = ev.target.closest("button"); if (!x) return; closeCtx(); react(m.id, x.dataset.e === myRx ? "" : x.dataset.e); });
+        return;
+      }
+      closeCtx(); react(m.id, b.dataset.e === myRx ? "" : b.dataset.e);
+    });
+    menu.addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-a]"); if (!b) return;
+      const a = b.dataset.a; closeCtx();
+      if (a === "reply") setReply(m, chat);
+      else if (a === "forward") forwardPicker(m);
+      else if (a === "edit") startEdit(m);
+      else if (a === "copy") { try { await navigator.clipboard.writeText(text); toast("Copied"); } catch (er) { toast("Couldn't copy", "err"); } }
+      else if (a === "translate") translateMsg(text);
+      else if (a === "pin") pinMsg(chat, m, pinned);
+      else if (a === "unsend") unsendMsg(chat, m);
+    });
+  }
+
+  // ---- edit (own text messages; re-encrypted in the browser, shown as "edited")
+  function startEdit(m) {
+    editing = m.id; replyTo = null;
+    const bar = $("#reply-bar"), inp = $(".composer input[name=text]"); if (!bar || !inp) return;
+    bar.hidden = false;
+    bar.innerHTML = `<div class="reply-bar"><div class="grow"><b>Editing message</b><div class="muted small ellipsis">${esc((m.payload.t || "").slice(0, 80))}</div></div><button class="icon-btn" data-action="edit-cancel" aria-label="Cancel edit">${icon("close")}</button></div>`;
+    inp.value = m.payload.t || ""; inp.focus();
+  }
+  App.actions["edit-cancel"] = () => { editing = null; clearReply(); const inp = $(".composer input[name=text]"); if (inp) inp.value = ""; };
+  async function doEdit(chat, mid, text) {
+    const m = (msgStore.get(chat.id) || []).find((x) => x.id === mid); if (!m || m.payload.t === text) return;
+    const old = m.payload, oldAt = m.edited_at;
+    m.payload = { ...old, t: text }; m.edited_at = new Date().toISOString(); repaintMsg(chat, m);
+    try {
+      let body;
+      if (chat.type === "channel") body = { message_id: mid, ciphertext: text, iv: "" };
+      else { const sealed = await C.encryptText(await convKey(chat), JSON.stringify({ v: 1, ...m.payload })); body = { message_id: mid, ciphertext: sealed.ciphertext, iv: sealed.iv }; }
+      await api.post("/chats/edit", body); App.cacheDrop("msgs:" + chat.id);
+      previews.set(chat.id, previewMsg(chat, (msgStore.get(chat.id) || []).slice(-1)[0] || m)); paintList();
+    } catch (e) { m.payload = old; m.edited_at = oldAt; repaintMsg(chat, m); fail(e, "Couldn't edit"); }
+  }
+
+  // ---- pin
+  function pinBarHtml(chat, list) {
+    const pm = chat.pinned_message_id && (list || msgStore.get(chat.id) || []).find((x) => x.id === chat.pinned_message_id);
+    return pm ? `<div class="pin-bar" data-action="m-jump" data-mid="${esc(pm.id)}">${icon("pin")}<span class="grow"><b>Pinned</b> · ${esc(previewOf(pm.payload).slice(0, 80))}</span><button class="icon-btn" data-action="m-unpin" aria-label="Unpin">${icon("close")}</button></div>` : "";
+  }
+  function updatePinBar(chat) {
+    const box = $("#msgs"); if (!box || openId !== chat.id) return;
+    const old = $(".pin-bar", box); if (old) old.remove();
+    const h = pinBarHtml(chat); if (h) box.insertAdjacentHTML("afterbegin", h);
+  }
+  async function pinMsg(chat, m, was) {
+    const before = chat.pinned_message_id || null;
+    chat.pinned_message_id = was ? null : m.id; updatePinBar(chat);
+    try { await api.post("/chats/pin", { conversation_id: chat.id, message_id: was ? null : m.id }); App.cacheDrop("chats"); toast(was ? "Unpinned" : "Pinned to the top of this chat"); }
+    catch (e) { chat.pinned_message_id = before; updatePinBar(chat); fail(e, "Couldn't pin"); }
+  }
+  App.actions["m-unpin"] = (el, ev) => { if (ev) ev.stopPropagation(); const chat = find(openId); if (chat && chat.pinned_message_id) pinMsg(chat, { id: chat.pinned_message_id }, true); };
+
+  // ---- unsend (removes it for everyone)
+  async function unsendMsg(chat, m) {
+    if (!(await App.confirm("Unsend message?", "It will be removed for everyone in this chat.", "Unsend", true))) return;
+    const list = msgStore.get(chat.id) || [], i = list.indexOf(m); if (i < 0) return;
+    list.splice(i, 1); const row = $(`.mrow[data-mid="${m.id}"]`); if (row) row.remove();
+    try { await api.del("/chats/messages/" + m.id); App.cacheDrop("msgs:" + chat.id); if (chat.pinned_message_id === m.id) { chat.pinned_message_id = null; updatePinBar(chat); } }
+    catch (e) { list.splice(i, 0, m); if (openId === chat.id) paintMessages(chat, list); fail(e, "Couldn't unsend"); }
+  }
+
+  // ---- translate (chats are E2EE, so the text goes to a third-party API only after the user confirms)
+  async function translateMsg(text) {
+    if (!(await App.confirm("Translate this message?", "The text is sent to MyMemory, a third-party translation service, because LokaChat can't read encrypted messages itself.", "Translate"))) return;
+    const to = (navigator.language || "en").slice(0, 2).toLowerCase();
+    try {
+      const res = await fetch("https://api.mymemory.translated.net/get?q=" + encodeURIComponent(text.slice(0, 450)) + "&langpair=Autodetect%7C" + encodeURIComponent(to));
+      if (!res.ok) throw new Error("Translation failed (" + res.status + ")");
+      const d = await res.json(), out = d && d.responseData && d.responseData.translatedText;
+      if (!out) throw new Error("No translation was returned");
+      modal(`<h3>Translation</h3><p class="muted small">${esc(text)}</p><p style="font-size:17px">${esc(out)}</p><div class="modal-actions"><button class="btn" data-action="close-modal">Close</button></div>`);
+    } catch (e) { fail(e, "Couldn't translate"); }
+  }
+
+  // ---- forward (friend picker; attachments are re-encrypted for the target conversation)
+  function forwardPicker(m) {
+    const pl = m.payload, targets = S.chats.filter((c) => c.type !== "channel" || pl.k === "text").filter(canPost);
+    const md = modal(`<h3>Forward to...</h3><div class="list-card card">${targets.map((c) => `<div class="user-row" data-fw="${esc(c.id)}">${avatarOf(c)}<div class="grow"><b class="ellipsis" style="display:block">${esc(titleOf(c))}</b></div><button type="button" class="btn sm">Send</button></div>`).join("") || '<p class="muted small" style="padding:14px">No chats yet.</p>'}</div>`, { noFocus: true });
+    md.el.addEventListener("click", async (e) => {
+      const row = e.target.closest("[data-fw]"); if (!row || row.dataset.done) return;
+      row.dataset.done = "1"; const btn = $("button", row); btn.textContent = "Sending...";
+      try { await forwardTo(find(row.dataset.fw), m); btn.textContent = "Sent ✓"; }
+      catch (er) { delete row.dataset.done; btn.textContent = "Send"; fail(er, "Couldn't forward"); }
+    });
+  }
+  async function forwardTo(dst, m) {
+    if (!dst) throw new Error("Chat not found");
+    const pl = m.payload, keep = replyTo; replyTo = null;
+    try {
+      if (["image", "video", "audio", "voice"].includes(pl.k)) {
+        const url = m.localUrl || attCache.get(pl.p);
+        if (!url) throw new Error("Let the attachment finish loading first");
+        const blob = await (await fetch(url)).blob();
+        sendFile(dst, new File([blob], pl.n || "file", { type: pl.m || blob.type }), pl.k, pl.d);
+      } else {
+        const { r, _file, p, ...rest } = pl;
+        sendPayload(dst, dst.type === "channel" ? { k: "text", t: rest.t || "" } : { ...rest, fw: 1 });
+      }
+    } finally { replyTo = keep; }
+  }
+
+  /** Send a payload (e.g. a shared post) into the E2EE direct chat with @username; opens the chat first if needed. */
+  App.sendToUser = async (username, payload) => {
+    try {
+      let chat = S.chats.find((c) => c.type === "direct" && c.members.some((u) => u.username === username));
+      if (!chat) { const res = await createChat("direct", "", "", [username]); await loadChats(true); chat = find(res.id); }
+      if (!chat) throw new Error("Couldn't open that chat");
+      const tmp = await sendPayload(chat, payload);
+      return !tmp.failedSend;
+    } catch (e) { fail(e, "Couldn't send"); return false; }
+  };
+
   // ---------- emoji + GIF picker ----------
   const EMOJI = ("😀 grin|😂 laugh lol|🤣 rofl|😊 smile|😍 love eyes|🥰 adore|😘 kiss|😎 cool|🤔 think|😢 cry sad|😭 sob|😡 angry|😴 sleep|🤯 mind blown|🥳 party|😇 angel|😉 wink|🙃 upside|😅 sweat|🤗 hug|😬 grimace|🙄 eyeroll|😮 wow|😱 scream|🤩 star struck|😜 silly|🥺 pleading|😏 smirk|😋 yum|🤤 drool|🤒 sick|🤕 hurt|" +
     "👍 thumbs up yes|👎 thumbs down no|👏 clap|🙌 raise hands|🙏 pray thanks please|💪 strong muscle|🤝 deal handshake|✌️ peace|🤞 luck fingers|👌 ok|👋 wave hi|🤙 call me|🫶 heart hands|✊ fist|☝️ point up|👀 eyes look|🧠 brain|" +
@@ -527,6 +713,7 @@
     "🐶 dog|🐱 cat|🦊 fox|🐼 panda|🦁 lion|🐸 frog|🦄 unicorn|🐢 turtle|🌹 rose|🌸 blossom|🌈 rainbow|☀️ sun|🌙 moon|⚡ lightning|❄️ snow|🌊 wave|🍕 pizza|🍔 burger|🍟 fries|🍩 donut|🍦 ice cream|☕ coffee|🍺 beer|🍷 wine|🎂 cake|" +
     "⚽ football soccer|🏀 basketball|🏏 cricket|🎮 gaming|🎵 music note|🎧 headphones|🎤 mic sing|📸 camera|🚀 rocket|✈️ plane|🚗 car|🏠 home|💡 idea|📚 books|💻 laptop|📱 phone|⏰ clock time|✅ check done|❌ cross|⚠️ warning|🔒 lock|🎯 target|💸 money fly|🤑 money face").split("|").map((s) => { const i = s.indexOf(" "); return [s.slice(0, i), s.slice(i + 1)]; });
   const STICKERS = [["😂", "lol laugh funny"], ["😭", "cry sob sad"], ["🥹", "touched aww"], ["😍", "love heart eyes"], ["🔥", "fire lit hot"], ["💯", "hundred perfect"], ["👏", "clap bravo"], ["🙏", "thanks please pray"], ["😎", "cool"], ["🤯", "mind blown wow"], ["🥳", "party celebrate"], ["😴", "sleepy tired"], ["🤔", "hmm think"], ["😡", "angry mad"], ["💀", "dead dying lol"], ["🫡", "salute respect"], ["🤝", "deal agree"], ["🎉", "congrats party"], ["❤️", "love heart"], ["👍", "yes ok good"], ["👎", "no bad"], ["😮", "wow surprise"], ["🤗", "hug"], ["💪", "strong gym"]];
+  App.STICKERS = STICKERS;
   const QUICK = ["❤️", "😂", "😮", "😢", "🔥", "👍", "🙏", "🎉"];
 
   App.actions["pick-toggle"] = () => {
@@ -635,6 +822,25 @@
       App.cacheDrop("msgs:" + chat.id);
       if (!viewing && !mine) { S.unread[chat.id] = (S.unread[chat.id] || 0) + 1; App.updateBadge(); }
       paintList();
+    },
+    /** Realtime UPDATE: a message was edited by its sender. */
+    async onEdit(raw) {
+      const chat = find(raw.conversation_id), list = chat && msgStore.get(chat.id), m = list && list.find((x) => x.id === raw.id);
+      if (!m || m.pending) return;
+      const d = await decode(chat, { id: raw.id, conversation_id: raw.conversation_id, sender_id: raw.sender_id, ciphertext: raw.ciphertext, iv: raw.iv || "", encrypted: raw.encrypted !== false, created_at: raw.created_at });
+      m.payload = d.payload; m.failed = d.failed; m.edited_at = raw.edited_at || new Date().toISOString();
+      App.cacheDrop("msgs:" + chat.id);
+      if (openId === chat.id) repaintMsg(chat, m);
+      if (list[list.length - 1] === m) { previews.set(chat.id, previewMsg(chat, m)); paintList(); }
+    },
+    /** Realtime DELETE: the sender unsent a message (removed for everyone). */
+    onDelete(old) {
+      if (!old || !old.id) return;
+      const cid = old.conversation_id || Array.from(msgStore.keys()).find((k) => (msgStore.get(k) || []).some((x) => x.id === old.id)); if (!cid) return;
+      const list = msgStore.get(cid), i = list ? list.findIndex((x) => x.id === old.id) : -1; if (i < 0) return;
+      list.splice(i, 1); App.cacheDrop("msgs:" + cid, "chats");
+      const row = $(`.mrow[data-mid="${old.id}"]`); if (row && openId === cid) row.remove();
+      const chat = find(cid); if (chat) { if (chat.pinned_message_id === old.id) { chat.pinned_message_id = null; updatePinBar(chat); } if (list.length) previews.set(cid, previewMsg(chat, list[list.length - 1])); paintList(); }
     },
     async onMembership() { try { await loadChats(true); } catch (e) { /* ignore */ } },
     onReaction(row) {

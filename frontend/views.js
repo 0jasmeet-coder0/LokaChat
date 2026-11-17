@@ -91,7 +91,7 @@
     root.className = "story-view";
     document.body.appendChild(root);
     const close = () => {
-      gone = true; cancelAnimationFrame(raf);
+      gone = true; cancelAnimationFrame(raf); App.stopClip();
       document.removeEventListener("keydown", onKey, true);
       root.remove();
       groups.forEach((g) => $$(`[data-ring="${g.author.id}"]`).forEach((r) => r.classList.toggle("seen", groupSeen(g))));
@@ -117,6 +117,8 @@
         ${isVid ? `<video src="${esc(s.media_url)}" autoplay playsinline></video>` : `<img src="${esc(s.media_url)}" alt="">`}
         ${s.caption ? `<div class="story-top" style="top:auto;bottom:0;background:linear-gradient(transparent,rgba(0,0,0,.8))">${esc(s.caption)}</div>` : ""}</div>`;
       vid = isVid ? root.querySelector("video") : null;
+      const mt = App.parseMusic(s.music);                      // story music: the chosen part of the song loops under the story
+      if (mt && mt.url) { App.playClip(mt); if (vid) vid.muted = true; } else App.stopClip();
       total = isVid ? Math.min(Math.max((s.duration || 8) * 1000, 3000), 60000) : 5000;
       startedAt = performance.now();
       const bar = root.querySelectorAll(".story-bars i b")[ii];
@@ -163,11 +165,11 @@
     const thumb = App.postThumb(p);
     return `<article class="vcard" data-action="open-post" data-id="${esc(p.id)}">
       <div class="thumb" ${isVideo(p) ? `data-prev="${esc(p.media_url)}"` : ""}>${thumb ? `<img src="${esc(thumb)}" alt="" loading="lazy">` : ""}
-        <span class="kind">${icon(kindIcon(p))}${kindLabel(p)}</span>
+        ${App.sponsBadge(p)}<span class="kind">${icon(kindIcon(p))}${kindLabel(p)}</span>
         ${p.duration ? `<span class="dur">${App.dur(p.duration)}</span>` : ""}</div>
       <div class="vmeta"><span data-action="open-profile" data-user="${esc(p.author.username)}">${avatar(p.author, "s")}</span>
         <div class="grow"><div class="vtitle">${esc(p.title)}</div>
-        <div class="muted small">${esc(p.author.display_name)} · ${App.num(p.views)} views · ${App.timeAgo(p.created_at)}</div></div></div></article>`;
+        <div class="muted small">${esc(p.author.display_name)} · ${App.num(p.views)} views · ${App.timeAgo(p.created_at)}</div>${App.adCta(p)}</div></div></article>`;
   }
   App.vcard = vcard;
 
