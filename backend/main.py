@@ -27,8 +27,8 @@ import auth_2fa as auth  # noqa: E402
 from config import settings
 from database import first, public_url, remove_files, rows, table
 from models import (
-    ChatCreate, FollowIn, KeyIn, KeysIn, LikeIn, LoginIn, PostCreate, ProfileUpdate, ResendIn,
-    SendIn, SignupIn, TwoFADisableIn, TwoFAVerifyIn, VerifyOtpIn, ViewIn, check_uuid, contact_kind,
+    FORMAT_BY_TYPE, ChatCreate, FollowIn, GoogleIn, GoogleSetupIn, KeyIn, KeysIn, LikeIn, LoginIn, PostCreate, ProfileUpdate,
+    ResendIn, SendIn, SignupIn, TwoFADisableIn, TwoFAVerifyIn, VerifyOtpIn, ViewIn, check_uuid, clean_username, contact_kind,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -85,7 +85,9 @@ def pub(u: Optional[dict], key: bool = False) -> Optional[dict]:
     if not u:
         return None
     d = {"id": u["id"], "username": u["username"], "display_name": u["display_name"],
-         "bio": u.get("bio") or "", "avatar_url": public_url(u.get("avatar_path"))}
+         "bio": u.get("bio") or "",
+         # own upload wins; Google users fall back to their Google picture until they upload one
+         "avatar_url": public_url(u.get("avatar_path")) or u.get("oauth_avatar_url") or None}
     if key:
         d["public_key"] = u.get("public_key")
     return d
@@ -101,6 +103,7 @@ def me_shape(u: dict) -> dict:
     d.update({
         "key_backup": u.get("key_backup"),  # password-encrypted E2EE key (opaque to the server)
         "totp_enabled": bool(u.get("totp_enabled")),
+        "auth_provider": u.get("auth_provider") or "password",
         "followers": count(rows(table("follows").select("follower_id").eq("following_id", uid))),
         "following": count(rows(table("follows").select("following_id").eq("follower_id", uid))),
         "posts": count(rows(table("posts").select("id").eq("author_id", uid))),
@@ -269,6 +272,131 @@ def me(user: dict = Depends(current_user)):
     return me_shape(user)
 
 
+# ====================================================== auth: Google (Supabase OAuth)
+def safe_google_avatar(url) -> Optional[str]:
+    """Only https googleusercontent.com pictures are stored/shown (the value ends up in <img src>)."""
+    from urllib.parse import urlparse
+    u = urlparse(str(url or ""))
+    host = (u.hostname or "").lower()
+    ok = u.scheme == "https" and (host == "googleusercontent.com" or host.endswith(".googleusercontent.com"))
+    return str(url) if ok and len(str(url)) <= 400 else None
+
+
+def google_identity(access_token: str) -> dict:
+    """Ask Supabase Auth who owns this access token (it validates signature + expiry). Only a Google identity with a
+    verified email is accepted - a plain Supabase email/password sign-up can never become a LokaChat session."""
+    import httpx
+    try:
+        r = httpx.get(f"{settings.SUPABASE_URL}/auth/v1/user", timeout=10,
+                      headers={"apikey": settings.SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {access_token}"})
+    except httpx.HTTPError:
+        raise HTTPException(502, "Couldn't reach Google sign-in. Please try again.")
+    if r.status_code != 200:
+        raise HTTPException(401, "Google sign-in expired. Please try again.")
+    u = r.json()
+    ident = next((i for i in u.get("identities") or [] if i.get("provider") == "google"), None)
+    if not ident:
+        raise HTTPException(400, "That sign-in is not a Google account")
+    d, meta = ident.get("identity_data") or {}, u.get("user_metadata") or {}
+    email = str(d.get("email") or u.get("email") or "").strip().lower()
+    sub = str(d.get("sub") or ident.get("provider_id") or "")
+    if not email or not sub:
+        raise HTTPException(400, "Google did not share an email address")
+    if not (d.get("email_verified") or u.get("email_confirmed_at")):
+        raise HTTPException(403, "Your Google email address is not verified")
+    name = str(d.get("full_name") or d.get("name") or meta.get("full_name") or meta.get("name") or "").strip()[:40]
+    pic = safe_google_avatar(d.get("avatar_url") or d.get("picture") or meta.get("avatar_url") or meta.get("picture"))
+    return {"sub": sub, "email": email, "name": name, "picture": pic}
+
+
+def suggest_username(seed: str) -> str:
+    base = re.sub(r"[^a-z0-9_.]+", "_", (seed or "").lower()).strip("_.")[:16]
+    if len(base) < 3:
+        base = (base + "user")[:16]
+    for i in range(6):
+        cand = base if i == 0 else f"{base}{random.randint(10, 9999)}"
+        taken = first(table("users").select("id,is_verified").eq("username", cand))
+        if not taken or not taken["is_verified"]:
+            return cand
+    return f"user{random.randint(100000, 999999)}"
+
+
+def google_login(g: dict) -> Optional[dict]:
+    """Sign in an existing user: matched by Google id, else by verified email (which links the Google id to that account).
+    Returns None for a brand-new person (they still have to pick a @username). 2FA stays enforced."""
+    user = first(table("users").select("*").eq("google_sub", g["sub"]))
+    if not user:
+        user = first(table("users").select("*").eq("email", g["email"]))
+        if user and not user["is_verified"]:
+            table("users").delete().eq("id", user["id"]).execute()   # abandoned sign-up; Google now proves the address
+            user = None
+        if user:
+            link = {"google_sub": g["sub"]}
+            if g.get("picture") and not user.get("oauth_avatar_url"):
+                link["oauth_avatar_url"] = g["picture"]
+            table("users").update(link).eq("id", user["id"]).execute()
+            user = {**user, **link}
+    if not user:
+        return None
+    if user.get("totp_enabled"):
+        return {"step": "totp", "mfa_token": auth.create_mfa_token(user, "totp")}
+    return session_for(user)
+
+
+@app.post("/auth/google")
+def google_auth(body: GoogleIn, request: Request):
+    """Returns a session ({token, user}), {step:'totp', mfa_token}, or {step:'setup', setup_token, ...} for new users."""
+    limiter.hit(f"google:{client_ip(request)}", 30, 600)
+    g = google_identity(body.access_token)
+    res = google_login(g)
+    if res:
+        return res
+    seed = g["email"].split("@")[0] or g["name"]
+    setup = auth.create_token({"id": g["sub"], "username": ""}, "gsetup", 900,
+                              {"email": g["email"], "name": g["name"], "picture": g["picture"]})
+    suggested = suggest_username(seed)
+    return {"step": "setup", "setup_token": setup, "suggested_username": suggested, "display_name": g["name"] or suggested,
+            "avatar_url": g["picture"], "destination": auth.mask_contact(g["email"])}
+
+
+@app.post("/auth/google/complete")
+def google_complete(body: GoogleSetupIn, request: Request):
+    """Finish Google onboarding: create the account with the chosen @username + display name."""
+    limiter.hit(f"google-setup:{client_ip(request)}", 20, 600)
+    c = auth.decode_token(body.setup_token, "gsetup")
+    g = {"sub": str(c["sub"]), "email": str(c["email"]), "name": c.get("name") or "", "picture": safe_google_avatar(c.get("picture"))}
+    res = google_login(g)                      # already onboarded (double submit / retry) -> just sign in
+    if res:
+        return res
+    taken = first(table("users").select("*").eq("username", body.username))
+    if taken and taken["is_verified"]:
+        raise HTTPException(409, "That username is taken")
+    if taken:
+        table("users").delete().eq("id", taken["id"]).execute()
+    fields = {"username": body.username, "display_name": body.display_name, "email": g["email"], "phone": None,
+              "password_hash": None, "is_verified": True, "auth_provider": "google", "google_sub": g["sub"],
+              "oauth_avatar_url": g["picture"]}
+    try:
+        user = rows(table("users").insert(fields))[0]
+    except Exception:
+        if first(table("users").select("id").eq("username", body.username)):      # lost a race for the username
+            raise HTTPException(409, "That username is taken")
+        raise
+    return session_for(user)
+
+
+@app.get("/auth/username-available")
+def username_available(request: Request, username: str = Query("", max_length=40)):
+    limiter.hit(f"uname:{client_ip(request)}", 60, 600)
+    try:
+        name = clean_username(username)
+    except ValueError as e:
+        return {"available": False, "username": username, "reason": str(e)}
+    taken = first(table("users").select("id,is_verified").eq("username", name))
+    busy = bool(taken and taken["is_verified"])
+    return {"available": not busy, "username": name, "reason": "That username is taken" if busy else ""}
+
+
 # ================================================================ auth: 2FA
 @app.post("/auth/2fa/setup")
 def twofa_setup(user: dict = Depends(current_user)):
@@ -314,7 +442,7 @@ def twofa_disable(body: TwoFADisableIn, user: dict = Depends(current_user)):
     if not user.get("totp_enabled"):
         raise HTTPException(400, "2FA is not enabled")
     limiter.hit(f"2fa-user:{user['id']}", 10, 600)
-    if not auth.verify_password(body.password, user["password_hash"]):
+    if user.get("password_hash") and not auth.verify_password(body.password, user["password_hash"]):   # Google-only accounts have no password
         raise HTTPException(401, "Incorrect password")
     if auth.verify_totp(auth.decrypt_secret(user["totp_secret"]), body.code, user.get("totp_last_step") or 0) is None:
         raise HTTPException(400, "Invalid or expired code")
@@ -463,6 +591,9 @@ def shape_posts(posts: list, user: dict) -> list:
         "media_url": public_url(p["media_path"]), "poster_url": public_url(p.get("poster_path")),
         "views": p.get("views") or 0, "likes": p.get("likes") or 0, "liked": p["id"] in liked,
         "is_sponsored": bool(p.get("is_sponsored")), "cta_label": p.get("cta_label") or "", "cta_url": p.get("cta_url") or "",
+        "format": p.get("format") or FORMAT_BY_TYPE.get(p["type"], "post"), "allow_download": p.get("allow_download") is not False,
+        "ad_placement": p.get("ad_placement") or "none",
+        **({"ad_budget": float(p.get("ad_budget") or 0)} if p["author_id"] == user["id"] else {}),   # budget is private to the creator
         "pinned_comment_id": p.get("pinned_comment_id"),
         "created_at": p["created_at"], "expires_at": p.get("expires_at"), "author": pub(authors.get(p["author_id"])),
     } for p in posts]
@@ -490,10 +621,18 @@ def create_post(body: PostCreate, user: dict = Depends(current_user)):
             raise HTTPException(400, "Stories must be a photo or video")
         if body.type != "story" and not body.title.strip():
             raise HTTPException(422, "A title is required")
-    sponsored = bool(body.is_sponsored and body.type in ("video", "clip", "photo"))   # stories / community posts can't be ads
+    fmt = FORMAT_BY_TYPE[body.type]                    # v7: format follows the upload type
+    if body.format and body.format != fmt:
+        raise HTTPException(422, f"A '{body.type}' upload uses the '{fmt}' format")
+    placement = body.ad_placement
+    sponsored = bool((body.is_sponsored or placement != "none") and body.type in ("video", "clip", "photo"))   # stories / community posts can't be ads
+    if sponsored and placement in ("preroll", "midroll") and body.type != "video":
+        raise HTTPException(422, "Pre-roll and mid-roll ads are only for videos")
+    placement = (placement if placement != "none" else "feed") if sponsored else "none"
     if sponsored and body.cta_label == "Visit site" and not body.cta_url:
         raise HTTPException(422, "Add the link your 'Visit site' button should open")
     row = {
+        "format": fmt, "allow_download": body.allow_download, "ad_placement": placement, "ad_budget": body.ad_budget if sponsored else 0,
         "is_sponsored": sponsored, "cta_label": (body.cta_label or "Watch") if sponsored else "", "cta_url": body.cta_url if sponsored else "",
         "author_id": user["id"], "type": body.type, "title": body.title.strip(), "caption": body.caption.strip(),
         "visibility": "followers" if body.type == "story" else "public" if body.type == "clip" else body.visibility,
@@ -545,7 +684,7 @@ def inject_ads(items: list, ads: list, every: int) -> list:
 
 
 def sponsored_pool(types: list, exclude_ids: set, n: int = 8) -> list:
-    ads = rows(table("posts").select("*").eq("is_sponsored", True).eq("visibility", "public").in_("type", types).order("created_at", desc=True).limit(40))
+    ads = rows(table("posts").select("*").eq("is_sponsored", True).eq("ad_placement", "feed").eq("visibility", "public").in_("type", types).order("created_at", desc=True).limit(40))
     ads = [a for a in ads if a["id"] not in exclude_ids]
     random.shuffle(ads)
     return ads[:n]

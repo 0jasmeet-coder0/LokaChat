@@ -41,7 +41,8 @@
   function paintHead() {
     const box = $("#you-head"); if (!box) return;
     const u = S.user;
-    box.innerHTML = `<div class="profile-head" style="position:relative"><button class="icon-btn set-mobile" data-action="open-settings" aria-label="Settings" style="position:absolute;top:-6px;right:-6px;z-index:2">${icon("gear")}</button>${avatar(u, "xl")}<div class="grow"><h2>${esc(u.display_name)}</h2><div class="muted">@${esc(u.username)}</div>
+    const switcher = App.acctBtn ? App.acctBtn() : "";
+    box.innerHTML = `<div class="profile-head" style="position:relative"><div class="ph-tools">${switcher}<button class="icon-btn set-mobile" data-action="open-settings" aria-label="Settings & Activity">${icon("gear")}</button></div>${avatar(u, "xl")}<div class="grow"><h2>${esc(u.display_name)}</h2><div class="muted">@${esc(u.username)}</div>
       <div class="stats"><div><b>${App.num(u.posts)}</b><span class="muted small">Posts</span></div><div><b>${App.num(u.followers)}</b><span class="muted small">Followers</span></div><div><b>${App.num(u.following)}</b><span class="muted small">Following</span></div></div>
       ${u.bio ? `<p class="bio">${esc(u.bio)}</p>` : ""}
       <div class="row wrap"><button class="btn sm" data-action="edit-profile">Edit Profile</button><button class="btn sm" data-action="open-security">${icon("shield")}Security & 2FA</button>
@@ -87,15 +88,38 @@
 
   // ============================================================ profile editing
   // ---------- sidebar: Settings + More ----------
-  App.actions["open-settings"] = () => {
-    App.closeMenus();
-    modal(`<h3>Settings</h3><div class="stack">
-      <button class="btn block" data-action="edit-profile">${icon("edit")}Edit profile</button>
-      <button class="btn block" data-action="open-privacy">${icon("lock")}Privacy</button>
-      <button class="btn block" data-action="open-security">${icon("shield")}Security & 2FA</button>
-      <button class="btn block" data-action="more-vault">${icon("key")}2FA Vault</button>
-      <button class="btn block" data-action="toggle-pin">${icon("arrow-left")}Pin / collapse sidebar</button></div>`, {});
+  // v7: Settings is now a full page (Settings & Activity) rather than a small modal.
+  App.actions["open-settings"] = () => { App.closeMenus(); App.go("/settings"); };
+  App.actions["settings-back"] = () => { if (history.length > 1) history.back(); else App.go("/you"); };
+  App.actions["more-liked"] = () => goYou("tabs", "liked");
+  App.routes.settings = {
+    mount(pane) { pane.innerHTML = '<div class="page settings-page" id="set-page"></div>'; },
+    show() { paintSettings(); },
   };
+  function paintSettings() {
+    const box = $("#set-page"); if (!box) return;
+    const u = S.user, on = (u.totp_enabled ? "On" : "Off");
+    const row = (act, ic, label, sub, dataset) => `<button class="set-row" data-action="${act}"${dataset || ""}>${icon(ic)}<span class="grow"><b>${esc(label)}</b>${sub ? `<small>${esc(sub)}</small>` : ""}</span><svg class="ic chev" style="width:16px;height:16px"><use href="#i-arrow-right"/></svg></button>`;
+    const sec = (t) => `<div class="set-sec">${esc(t)}</div>`;
+    box.innerHTML = `<div class="page-head row"><button class="icon-btn" data-action="settings-back" aria-label="Back">${icon("back")}</button><h3 class="grow" style="margin:0">Settings &amp; Activity</h3></div>
+      <div class="set-hero">${avatar(u, "xl")}<div class="grow"><b>${esc(u.display_name)}</b><span>@${esc(u.username)}</span></div></div>
+      <div class="set-stat"><div><b>${App.num(u.posts)}</b><span>Posts</span></div><div><b>${App.num(u.followers)}</b><span>Followers</span></div><div><b>${App.num(u.following)}</b><span>Following</span></div></div>
+      ${sec("Account")}
+      <div class="set-list">${row("open-switcher", "user", "Switch account", "@" + u.username + " \u00b7 " + (u.auth_provider === "google" ? "Google" : "Password"))}
+        ${row("edit-profile", "edit", "Edit profile", "Name, bio and photo")}
+        ${row("open-privacy", "lock", "Privacy", "Visibility and encryption")}</div>
+      ${sec("Activity")}
+      <div class="set-list">${row("more-history", "clock", "Watch history", "Videos you watched")}
+        ${row("more-saved", "bookmark", "Saved", "Posts you saved")}
+        ${row("more-liked", "heart", "Liked videos", "Videos you liked")}</div>
+      ${sec("Security")}
+      <div class="set-list">${row("open-security", "shield", "Security & 2FA", "Two-factor is " + on)}
+        ${row("more-vault", "key", "Authenticator vault", "Local encrypted codes")}</div>
+      ${sec("App")}
+      <div class="set-list">${row("toggle-pin", "pin", "Pin / collapse sidebar", "Desktop layout")}</div>
+      <button class="btn danger block" style="margin-top:18px" data-action="logout">${icon("logout")}Log out</button>
+      <p class="muted small center" style="margin:18px 0 6px">LokaChat v7</p>`;
+  }
   App.actions["open-privacy"] = () => modal(`<h3>Privacy</h3><div class="stack"><p class="muted">Your email and phone number are never shown on your profile.</p>
     <p class="muted">Direct and group chats are end-to-end encrypted in your browser. Channels are public broadcasts and are not encrypted.</p>
     <p class="muted">Posts set to "Followers only" are hidden from everyone else. Dislikes are private and stay on this device.</p>

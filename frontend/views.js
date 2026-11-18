@@ -192,10 +192,12 @@
   App.dbl["like-post"] = (el, pt) => { App.burst(el, pt); App.toggleLike(el.dataset.id, "on"); };
 
   App.actions["open-post"] = (el) => { const p = S.postCache.get(el.dataset.id); if (p) App.openPost(p); };
+  // v7: route strictly by format - reels open in the Reels Player, videos in the Theater Player.
+  App.postFormat = (p) => p.format || (p.type === "clip" ? "reel" : p.type === "video" ? "video" : "post");
   App.openPost = (p) => {
     App.closeAllModals();
     if (p.type === "community") { App.openComments(p.id); return; }
-    App.go("/watch/" + p.id);
+    App.go((App.postFormat(p) === "reel" ? "/reels/" : "/watch/") + p.id);
   };
   App.actions["open-profile"] = (el, ev) => { ev.stopPropagation(); openProfile(el.dataset.user); };
 

@@ -1,4 +1,4 @@
-# LokaChat — Project Spec (v6 + PWA/Capacitor)
+# LokaChat — Project Spec (v7)
 
 Mobile-first, desktop-responsive social app: YouTube-style video hub, Instagram-style follows, stories, reels and notes,
 WhatsApp/Instagram-style end-to-end encrypted chat, authenticator (TOTP) vault.
@@ -81,7 +81,7 @@ Scrollbars: vertical 3px, thumb `#222630`, transparent track; horizontal scrollb
 - Rail order: Home, Reels, Messages, Search, Notifications, Create, Profile; Settings (gear) and More (☰: Saved, Watch history, Security & 2FA vault, Log out) pinned at the bottom (`.rail-bottom{margin-top:auto}`). Pin/collapse arrow (←/→) sits next to the wordmark. Inline SVG favicon in `index.html` (no `/favicon.ico` request).
 
 ### PWA
-- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; network-first for static files; bump `VERSION` on deploys, currently `lokachat-shell-v6`), registered in `app.js` (skipped inside Capacitor; the page reloads once when a new worker takes control). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
+- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; network-first for static files; bump `VERSION` on deploys, currently `lokachat-shell-v7-final`), registered in `app.js` (skipped inside Capacitor; the page reloads once when a new worker takes control). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
 - Icons: run `node tools/make-icons.js` from the project root to generate `frontend/assets/icon-192.png` and `icon-512.png` (dependency-free). `frontend/assets/icon.svg` is the vector source.
 
 ### Capacitor (Android/iOS)
@@ -104,7 +104,7 @@ Scrollbars: vertical 3px, thumb `#222630`, transparent track; horizontal scrollb
 
 ### Watch page / player
 - Floating bottom-right **miniplayer** (play/pause, ✕, click to maximize) when the stage scrolls out of view after playback started (PC + mobile; sits above the bottom nav on mobile).
-- **Auto-CC**: uses real `.vtt` tracks when present, otherwise the Web Speech API + `.vp-cc` caption overlay.
+- **Auto-CC**: reads the video's own `<track kind=captions|subtitles>` cues into the `.vp-cc` overlay; if the video has no caption track it toasts "Captions not available for this video". No microphone / Web Speech API.
 - **Adaptive resolution**: Auto / 1080p / 720p / 480p / 360p Data Saver drawn through a canvas (`App.attachScaler`) from the one stored file; Auto follows Network Information / player size. Speed 0.5×–2×.
 - Comments: `gap:14px` between Reply and Delete; GIF / sticker comments (`comments.gif_url`; GIPHY if `GIPHY_KEY` else built-in stickers); creator can 📌 Pin one top-level comment (`posts.pinned_comment_id`, shown first with a "Pinned by creator" tag) and delete any comment on their own post.
 
@@ -131,7 +131,7 @@ feed tabs `community` and `saved` · `POST /posts/create` accepts type `communit
 Database: run `backend/schema.sql`, then `backend/migrations/v4.sql`.
 
 ## Honest limitations
-- Resolution options are simulated on-device with a canvas from the single stored file: they change sharpness/CPU, **not** bandwidth. Auto-CC uses the microphone (it hears the speakers), is Chrome/Edge/Safari-only and not frame-accurate.
+- Resolution options are simulated on-device with a canvas from the single stored file: they change sharpness/CPU, **not** bandwidth.
 - Photo crop is baked into the upload; video is never cropped (preview Fit/Fill only). Waveform falls back to a synthetic one if the audio host blocks decoding.
 - Translate sends the message text to the third-party MyMemory API (after confirmation). Pinned DM messages only update for others on their next chat-list refresh.
 - GIF search needs `GIPHY_KEY` in `config.js`; without it only built-in stickers are offered. Sponsored ads are creator-labelled (no payments/targeting).
@@ -148,3 +148,48 @@ Modular, commented, no build step. Escape all interpolated text with `App.esc`. 
 - v3–v6 implemented (v6 = this session). v6 files were only syntax-checked (`node --check`, `py_compile`); no browser or live run yet.
 - v3, v4 and v5 complete. Backend tested with pytest (fake Supabase); frontend exercised in a jsdom end-to-end run (35 checks).
 - **Not yet verified against live Supabase/Vercel, live iTunes/CORS, a real Android build, or in real browsers.**
+
+
+## v7 specification (Part 1)
+
+### Database - run `backend/migrations/v7.sql` after `v6.sql`
+- `posts.format` (`video|reel|post`, derived from `type`: video→video, clip→reel, photo/community/story→post; a trigger fills it on insert), `allow_download` (default true), `ad_placement` (`none|feed|preroll|midroll`), `ad_budget` (numeric, default 0, creator-declared, no payments). v6 sponsored posts are back-filled to `ad_placement='feed'`.
+- `users`: `google_sub` (unique), `oauth_avatar_url`, `auth_provider` (`password|google`); `password_hash` is now nullable (Google-only accounts), guarded by `users_credential_required`.
+- API: `POST /posts/create` accepts `format` (must match the type), `allow_download`, `ad_placement`, `ad_budget`. Any non-`none` placement makes the post sponsored; `preroll`/`midroll` are videos only. Feed ad injection only uses `ad_placement='feed'`; **pre-roll / mid-roll serving in the player is not built yet (Part 2)**. `ad_budget` is only returned to the post's author. `allow_download=false` only hides the Download button - the `media` bucket is public.
+
+### Google sign-in (Supabase OAuth, PKCE)
+- Supabase Dashboard → Authentication → Providers → Google (client id/secret from Google Cloud) and Authentication → URL Configuration (Site URL + Redirect URLs: the Vercel URL and `http://localhost:PORT`).
+- Browser (`auth.js`): `signInWithOAuth` on a dedicated PKCE client (`storageKey loka-oauth`, `prompt=select_account`) → back on `/?code=` → `exchangeCodeForSession` → `POST /auth/google {access_token}`. The API verifies the token with Supabase (`GET /auth/v1/user`), requires a Google identity with a verified email, then: known `google_sub` or verified email → session (email match links the Google id); `totp_enabled` still returns `{step:"totp"}`; brand-new → `{step:"setup", setup_token, suggested_username}`.
+- Onboarding: `POST /auth/google/complete {setup_token, username, display_name}` creates the verified user (no password). `GET /auth/username-available?username=` powers the live check. Google picture is shown until the user uploads an avatar (`pub()` falls back to `oauth_avatar_url`, https `*.googleusercontent.com` only).
+- Hidden inside the Capacitor app (needs a deep-link redirect - not built).
+
+### Multi-account switcher (`auth.js`)
+- `localStorage loka_accounts_v1` = up to 5 `{id, username, display_name, avatar_url, token}`; kept in sync by `enterApp` → `App.accounts.sync`. Trigger `@username ⌄` in the top bar (`#acct-trigger`) and "Switch account" in the More menu → modal (switch, remove, Add account). Switch verifies the saved token with `GET /auth/me` first (401 → account dropped), then `App.session.reset()` + `enter()`. Logging out (or a 401) forgets that account's token; the sign-in screen lists the other saved accounts.
+- `app.js` hooks: `App.authDecorate`, `App.authStages`, `App.authResume`, `App.oauthPending/oauthComplete`, `App.auth`, `App.session` (`resetSession` = logout without touching saved accounts). `frontend` load order now `... v6.js → auth.js → app.js`; service worker `VERSION` is `lokachat-shell-v7`.
+- Limitation: saved tokens sit in localStorage like the existing `loka_token` (an XSS would expose all of them).
+- Not verified yet: live Supabase Google provider, a real browser, `npx cap sync` for the Android copy of `frontend`.
+
+## v7 specification (Part 2 & 3)
+
+### Mobile fit + smart scroll (`style.css`, `app.js`)
+- Strict mobile fit (`@media (max-width:767px)`): `html,body{max-width:100%;overflow-x:hidden}`, `#app{min-height:100dvh;overflow-x:clip}`, media capped at `100%`, single-column grids - **zero horizontal overflow down to 360px**.
+- YouTube/Instagram hide-on-scroll: `body.chrome-hidden` slides `#topbar` up and `#bottomnav` down (CSS transform). `app.js` (`initHideOnScroll`) tracks a capture-phase `scroll` listener on the internal scrollers for the Home/Messages routes only, with an 18px/14px threshold; near the top (`y<48`) and on `orientationchange`/route change the chrome is always shown. `prefers-reduced-motion` disables the transition.
+
+### Watch page / player (`watch.js`, `v6.js`)
+- **Draggable miniplayer**: while docked (`.vplayer.mini`), `pointerdown`/`pointermove`/`pointerup` (with `setPointerCapture`, `touch-action:none`) let the user drag it anywhere; `clampXY` keeps it on-screen; a light tap (<6px move) maximizes back to the theater view, and a drag >6px suppresses the click so it doesn't maximize by accident. `dock()` resets the inline drag position on every state change.
+- **Auto-CC** (see v6 line above) - no microphone anywhere; captions come from the video's own text tracks or a toast.
+- **Download**: the Theater action row shows a Download chip only when `allow_download !== false`; `App.actions["download-post"]` fetches the media to a blob and saves it (falls back to opening the URL when the cross-origin bucket blocks `fetch`).
+- **Create studio** (bottom `POST | STORY | REEL` tabs, `.cr-tabs`): `setFile()` auto-detects the format (image → post, 9:16/vertical video → reel, landscape video → video) and highlights the tab; an **Allow downloads** switch (`allow_download`) and a **Feed / Pre-Roll / Mid-Roll Ad** segment (`.cr-seg`, with `ad_budget`) map to the v7 `posts` columns. Pre-roll/mid-roll are only offered for videos (matches the backend's HTTP 422 guard).
+- **Sponsored ad playback** (`runAd`): a black `.ad-layer` overlays the stage for **5** seconds with a "Skip in N" button that unlocks at 0. `ad_placement='preroll'` runs before the first play (the play button starts the ad first); `midroll` runs once at ~50% (`timeupdate`). Both are gated on `is_sponsored`; `none`/`feed` never block playback. `destroy()` clears the interval and removes the layer.
+
+### Full-screen mobile chat, contacts, switcher (`chat.js`, `you.js`, `views.js`)
+- **Full-screen chat** (`<768px`): opening a conversation sets `body.in-chat` (`setInChat`), which hides `#bottomnav` + `#topbar` and expands `.chat-wrap.has-conv` to `100dvh`. `App.routes.messages.hide()` and `App.resetChat()` clear it, so the nav returns when leaving Messages / logging out.
+- **Suggested contacts**: `paintList()` appends a `#chat-suggest` host rendered by `loadSuggested()` ("Suggested contacts / Accounts to follow") from `/posts/feed?tab=explore&limit=40`, with an instant `explore` cache; already-followed accounts sort last.
+- **New Group Chat**: a `data-action="new-group"` header button opens a dedicated composer (`data-form="new-group"`) that calls the existing `createChat("group", ...)` path.
+- **Shared Reels/Videos in DMs** render a rich preview card (`msgHtml`, `.m-share`) carrying `data-pid`/`data-fmt`/`data-ty`; `App.actions["open-shared"]` opens the **Reels Player** when `format==='reel'` (or `type==='clip'`) and the **Theater Player** otherwise. `watch.js focusReel(id)` scrolls the Reels feed to the shared clip.
+- **Account switcher**: `App.acctBtn()` renders the `@username ⌄` trigger - used in the Messages header (`chat.js`) and the Profile header (`you.js` `.ph-tools`), alongside the mobile-only `⚙️` gear.
+- **Settings & Activity**: the gear opens a full `App.routes.settings` route (`you.js`) - hero (avatar/name/handle), Posts/Followers/Following stats, and Account / Activity / Security / App sections built from `.set-hero`/`.set-stat`/`.set-sec`/`.set-list`/`.set-row`; the desktop rail Settings item routes to the same page.
+- **Strict format routing**: `App.postFormat(p)` (`views.js`) = `p.format || (clip→reel, video→video, else post)`; `App.openPost` sends reels to `/reels/:id` and videos/photos to `/watch/:id`.
+- `frontend/service-worker.js` `VERSION` bumped to `lokachat-shell-v7-final`.
+- Limitation: the `media` bucket stays public - `allow_download=false` only hides the button. Not verified yet in a live browser.
+

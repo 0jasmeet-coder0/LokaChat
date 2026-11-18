@@ -23,6 +23,7 @@
   function renderAuth(error) {
     const body = $("#auth-body");
     const err = error ? `<div class="notice err">${esc(error)}</div>` : "";
+    if (App.authStages && App.authStages[auth.stage]) { body.innerHTML = App.authStages[auth.stage](auth, err); return; }   // v7 (auth.js): Google onboarding
     if (auth.stage === "otp") {
       const c = auth.ctx;
       body.innerHTML = `<h2 style="margin-top:18px">Enter your code</h2>
@@ -49,12 +50,15 @@
         <button class="btn primary block" type="submit">Create account</button>
         <p class="muted small center" style="margin:0">We'll send a 6-digit code to verify it's you.</p></form>`;
     }
+    if (App.authDecorate && auth.stage === "form") App.authDecorate(body, auth.tab);   // v7 (auth.js): Google button + saved accounts
   }
   App.actions["auth-tab"] = (el) => { auth = { tab: el.dataset.tab, stage: "form", ctx: {}, pw: null }; renderAuth(); };
   App.actions["auth-back"] = () => { auth = { tab: auth.tab, stage: "form", ctx: {}, pw: null }; renderAuth(); };
 
   const gotoOtp = (res, extra) => { auth.stage = "otp"; auth.ctx = { ...extra, destination: res.destination, expires_in: res.expires_in, dev_otp: res.dev_otp }; renderAuth(); };
   const fail = (e) => renderAuth(e.message || "Something went wrong");
+  // v7: hooks used by auth.js (Google sign-in, onboarding stage, account switcher)
+  App.auth = { get state() { return auth; }, setStage(stage, ctx) { auth = { tab: auth.tab, stage, ctx: ctx || {}, pw: null }; renderAuth(); }, render: renderAuth, show };
 
   App.forms.signup = async (form, data) => {
     auth.pw = data.password;
@@ -101,6 +105,7 @@
 
   async function enterApp(user) {
     S.user = user;
+    if (App.accounts) App.accounts.sync(user);   // v7: remember this account for the switcher
     show("#app");
     App.applyPin();
     App.setRailAvatar();
@@ -123,7 +128,8 @@
     App.startNotifPolling();
   }
 
-  function logout(message) {
+  /** Tear the signed-in session down (state, caches, realtime, DOM) without touching the saved-accounts list. */
+  function resetSession() {
     api.unsubscribe();
     api.setToken(null);
     App.stopNotifPolling();
@@ -135,6 +141,10 @@
     $("#view").innerHTML = "";
     document.body.classList.remove("in-app");
     location.hash = "";
+  }
+  function logout(message) {
+    if (App.accounts && S.user) App.accounts.remove(S.user.id);   // v7: logged out (or expired) -> forget its saved token
+    resetSession();
     auth = { tab: "in", stage: "form", ctx: {}, pw: null };
     show("#auth");
     renderAuth();
@@ -143,19 +153,47 @@
   App.actions.logout = async () => {
     if (await App.confirm("Log out?", "You'll need your password and a code to sign back in.", "Log out", true)) logout();
   };
+  App.session = { reset: resetSession, enter: enterApp, start: startSession };   // v7: used by the account switcher
   api.onUnauthorized(() => { if (S.user) logout("Your session expired - please sign in again."); });
 
   // ---------- header / shell wiring ----------
+  // v7: YouTube/Instagram style "hide-on-scroll" chrome state (top bar + bottom nav)
+  let chromeY = 0, chromeAcc = 0;
+  const setChrome = (hidden) => document.body.classList.toggle("chrome-hidden", hidden);
   App.onRouted = (name) => {
     const pill = $("#msg-pill-wrap");
     if (pill) pill.classList.toggle("gone", name === "messages");
+    chromeY = 0; chromeAcc = 0; setChrome(false);   // reset the scroll chrome on every route change
     App.closeMenus();
   };
+
+  /**
+   * Hide the top bar + bottom nav while scrolling down and reveal them on scroll up
+   * (Home/Messages on mobile). Listeners use capture so the internal scrollers
+   * (.chat-scroll, .msgs) drive the same behaviour as the window.
+   */
+  function initHideOnScroll() {
+    const ROUTES = { home: 1, messages: 1 };
+    const isMobile = () => window.matchMedia("(max-width: 767px)").matches;
+    const onScroll = (ev) => {
+      const t = ev.target;
+      if (!isMobile() || !ROUTES[document.body.dataset.route]) { setChrome(false); chromeAcc = 0; return; }
+      const scroller = t === document ? document.scrollingElement || document.documentElement : t;
+      const y = Math.max(0, scroller.scrollTop || 0);
+      if (y < 48) { chromeY = y; chromeAcc = 0; setChrome(false); return; }   // near the top -> always visible
+      chromeAcc += y - chromeY;
+      chromeY = y;
+      if (chromeAcc > 18) { setChrome(true); chromeAcc = 0; }        // scrolling down steadily -> hide
+      else if (chromeAcc < -14) { setChrome(false); chromeAcc = 0; } // scrolling up -> reveal
+    };
+    document.addEventListener("scroll", onScroll, true);
+    window.addEventListener("orientationchange", () => { chromeY = 0; chromeAcc = 0; setChrome(false); });
+  }
 
   // ============================================================ boot
   async function boot() {
     const splashDone = new Promise((r) => setTimeout(r, 1800));
-    let next = "auth", user = null, err = null;
+    let next = "auth", user = null, err = null, oauth = null;
 
     const missing = [];
     const cfg = window.LOKA_CONFIG || {};
@@ -165,7 +203,12 @@
     else if (api.isNative && api.isNative() && !api.apiRoot()) missing.push("MOBILE_API_URL (full https://YOUR-APP.vercel.app/api URL, needed inside the mobile app)");
     if (!window.supabase) missing.push("Supabase SDK failed to load (check your internet connection)");
 
+    // v7: returning from "Continue with Google" (?code=... in the URL)
+    if (!missing.length && App.oauthPending && App.oauthPending()) {
+      try { oauth = await App.oauthComplete(); } catch (e) { err = e.message || "Google sign-in failed"; }
+    }
     if (missing.length) next = "setup";
+    else if (oauth) next = "oauth";
     else if (api.hasToken()) {
       try { user = await api.get("/auth/me"); next = "app"; }
       catch (e) {
@@ -178,8 +221,11 @@
     if (next === "setup") {
       $("#setup-missing").innerHTML = missing.map((m) => `<li>${esc(m)}</li>`).join("");
       show("#setup");
-    } else if (next === "app") await enterApp(user);
-    else { show("#auth"); renderAuth(); if (err) toast(err, "err"); }
+    } else if (next === "app") { await enterApp(user); if (err) toast(err, "err"); }
+    else if (next === "oauth") {
+      if (oauth.token) await startSession(oauth);
+      else { show("#auth"); App.authResume(oauth); }          // 2FA code or new-user onboarding
+    } else { show("#auth"); renderAuth(); if (err) toast(err, "err"); }
   }
 
   // PWA: register the service worker (skipped inside the Capacitor app and on non-https/localhost dev)
@@ -195,6 +241,9 @@
     } catch (e) { /* ignore */ }
   }
   registerSW();
+
+  // v7: mobile chrome reacts to scrolling (top bar + bottom nav hide/reveal)
+  initHideOnScroll();
 
   window.addEventListener("DOMContentLoaded", boot);
 })();

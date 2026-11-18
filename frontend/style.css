@@ -854,3 +854,148 @@ body.pinned .more-menu { left: 12px; }
   .gridp { gap: 2px; }
   .page-head h2 { font-size: 22px; }
 }
+
+
+/* ================================================= v7 Part 1: Google sign-in + multi-account switcher */
+/* top-bar trigger: "@username v" */
+.acct-trigger { display: inline-flex; align-items: center; gap: 2px; max-width: 200px; min-height: 36px; padding: 0 10px; margin-right: 6px; border: 0; border-radius: 999px; background: transparent; color: var(--text-main); font: inherit; font-weight: 700; font-size: 14px; cursor: pointer; }
+.acct-trigger[hidden] { display: none; }
+.acct-trigger:hover { background: var(--bg-elevated); }
+.acct-trigger .at { color: var(--text-muted); font-weight: 600; }
+.acct-trigger #acct-name, .acct-trigger .acct-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct-trigger .ic { width: 16px; height: 16px; flex: none; margin-left: 2px; }
+@media (max-width: 767px) { .acct-trigger { max-width: 128px; padding: 0 6px; margin-right: 0; font-size: 13px; } }
+
+/* sign-in screen: divider + Google button */
+.auth-or { display: flex; align-items: center; gap: 12px; margin: 16px 0 12px; color: var(--text-muted); font-size: 12px; }
+.auth-or::before, .auth-or::after { content: ""; flex: 1; height: 1px; background: var(--border-subtle); }
+.g-btn { display: inline-flex; align-items: center; justify-content: center; gap: 10px; background: var(--bg-card); border: 1px solid var(--border-subtle); color: var(--text-main); }
+.g-btn:hover { background: var(--bg-elevated); }
+.g-logo { width: 18px; height: 18px; flex: none; }
+.auth-saved { margin-top: 18px; }
+.auth-saved > p { margin: 0 0 6px; }
+
+/* account list (switcher modal + "saved on this device") */
+.sw-list { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 4px; }
+.sw-item { display: flex; align-items: center; gap: 4px; }
+.sw-row { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; padding: 8px 10px; border: 0; border-radius: 14px; background: transparent; color: var(--text-main); font: inherit; text-align: left; cursor: pointer; }
+.sw-row:hover, .sw-row.on { background: var(--bg-elevated); }
+.sw-row:disabled { opacity: .6; cursor: default; }
+.sw-names { flex: 1; min-width: 0; display: grid; }
+.sw-names b, .sw-names small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sw-names small { color: var(--text-muted); font-size: 12px; }
+.sw-check { color: var(--accent-blue); display: inline-grid; }
+.sw-check .ic { width: 20px; height: 20px; }
+.sw-go { color: var(--accent-blue); font-size: 13px; font-weight: 600; }
+.sw-x { flex: none; color: var(--text-muted); }
+.sw-title { margin: 0 0 6px; }
+.sw-add { width: 100%; display: flex; align-items: center; gap: 12px; margin-top: 4px; padding: 8px 10px; border: 0; border-radius: 14px; background: transparent; color: var(--accent-blue); font: inherit; font-weight: 600; cursor: pointer; }
+.sw-add:hover { background: var(--bg-elevated); }
+.sw-plus { width: 40px; height: 40px; display: grid; place-items: center; border: 1px dashed var(--border-subtle); border-radius: 50%; }
+.sw-plus .ic { width: 20px; height: 20px; }
+.sw-note { margin: 12px 0 0; }
+
+/* Google onboarding: @username + display name */
+.gs-av { display: flex; justify-content: center; margin: 14px 0 6px; }
+.gs-av .avatar { width: 72px; height: 72px; font-size: 28px; }
+.at-input { display: flex; align-items: center; border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--bg-card); }
+.at-input > span { padding-left: 12px; color: var(--text-muted); font-weight: 600; }
+.at-input input { flex: 1; min-width: 0; border: 0 !important; background: transparent !important; box-shadow: none !important; padding-left: 4px; }
+.gs-hint { display: block; min-height: 16px; margin-top: 6px; font-size: 12px; color: var(--text-muted); }
+.gs-hint.ok { color: var(--accent-blue); }
+.gs-hint.bad { color: #F87171; }
+
+/* =====================================================================
+   v7 Parts 2-3: strict mobile viewport fit, hide-on-scroll chrome,
+   draggable miniplayer, full-screen mobile chat, mobile settings
+   ===================================================================== */
+
+/* ---- strict mobile fit: 100dvh shell, no horizontal overflow (down to 360px) ---- */
+@media (max-width: 767px) {
+  html { height: 100%; }
+  html, body { max-width: 100%; overflow-x: hidden; overscroll-behavior-x: none; }
+  #app { min-height: 100dvh; max-width: 100vw; overflow-x: clip; }
+  #main, #view { max-width: 100%; }
+  #view { overflow-wrap: anywhere; }
+  img, video, canvas, iframe, svg { max-width: 100%; }
+  .page { max-width: 100%; min-width: 0; }
+  .w-actions { flex-wrap: wrap; }
+  .grid, .w-next, .cr-launch { grid-template-columns: 1fr; }
+}
+
+/* ---- YouTube/Instagram style hide-on-scroll chrome (top bar + bottom nav) ---- */
+#topbar, #bottomnav { transition: transform .26s cubic-bezier(.4, 0, .2, 1); will-change: transform; }
+@media (max-width: 767px) {
+  body.chrome-hidden #topbar { transform: translateY(calc(-1 * var(--top-h) - 10px)); }
+  body.chrome-hidden #bottomnav { transform: translateY(calc(100% + 10px)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #topbar, #bottomnav { transition: none; }
+}
+
+/* ---- draggable miniplayer (drag to any corner, tap to maximize) ---- */
+.vplayer.mini { touch-action: none; }
+.vplayer.mini .mini-ctl { touch-action: none; }
+.vplayer.mini.dragging { animation: none; transition: none; cursor: grabbing; }
+.vplayer.mini .mini-ctl { cursor: grab; }
+.vplayer.mini.dragging .mini-ctl { cursor: grabbing; }
+
+/* ---- full-screen mobile chat: nav + top bar step aside inside a conversation ---- */
+@media (max-width: 767px) {
+  body.in-chat #bottomnav { transform: translateY(calc(100% + 10px)); pointer-events: none; }
+  body.in-chat #topbar { transform: translateY(calc(-1 * var(--top-h) - 10px)); }
+  body.in-chat .chat-wrap.has-conv { height: 100dvh; border-radius: 0; }
+  body.in-chat .conv-head { padding-top: env(safe-area-inset-top); }
+  body.in-chat .composer { padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+}
+
+/* ---- profile header tools: @username switcher + mobile gear ---- */
+.ph-tools { position: absolute; top: -6px; right: -6px; z-index: 2; display: flex; align-items: center; gap: 6px; }
+.chat-head .acct-trigger { min-height: 32px; }
+.chat-head .grow { flex: 1; }
+
+/* ---- suggested contacts / accounts to follow ---- */
+.sugg-h { display: flex; align-items: center; justify-content: space-between; margin: 14px 2px 8px; }
+.sugg-h b { font-size: 13px; letter-spacing: .3px; text-transform: uppercase; color: var(--text-muted); }
+.sugg-list { display: grid; gap: 4px; }
+.sugg-row { display: flex; align-items: center; gap: 12px; padding: 8px 6px; border-radius: 14px; }
+.sugg-row:hover { background: var(--bg-elevated); }
+.sugg-row .grow { flex: 1; min-width: 0; }
+.sugg-row b, .sugg-row span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sugg-row span { color: var(--text-muted); font-size: 12px; }
+
+/* ---- settings & activity (mobile) ---- */
+.set-hero { display: flex; align-items: center; gap: 14px; padding: 6px 0 16px; }
+.set-hero .avatar { width: 64px; height: 64px; }
+.set-hero .grow { flex: 1; min-width: 0; }
+.set-hero b { display: block; font-size: 18px; }
+.set-hero span { color: var(--text-muted); }
+.set-list { display: grid; gap: 2px; margin: 4px 0 14px; }
+.set-row { display: flex; align-items: center; gap: 12px; width: 100%; padding: 13px 10px; min-height: 48px; border: 0; border-radius: 12px; background: transparent; color: var(--text-main); font: inherit; text-align: left; cursor: pointer; }
+.set-row:hover { background: var(--bg-elevated); }
+.set-row .ic { width: 20px; height: 20px; color: var(--text-muted); flex: none; }
+.set-row .grow { flex: 1; min-width: 0; }
+.set-row small { display: block; color: var(--text-muted); font-size: 12px; }
+.set-row .chev { color: var(--text-muted); }
+.set-sec { margin: 18px 0 6px; font-size: 12px; font-weight: 800; letter-spacing: .4px; text-transform: uppercase; color: var(--text-muted); }
+.set-stat { display: flex; gap: 10px; margin: 6px 0 4px; }
+.set-stat > div { flex: 1; padding: 12px; border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--bg-card); text-align: center; }
+.set-stat b { display: block; font-size: 20px; }
+.set-stat span { color: var(--text-muted); font-size: 12px; }
+
+/* ---- create studio: bottom POST | STORY | REEL tabs ---- */
+.cr-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--border-subtle); }
+.cr-tabs button { padding: 11px 8px; min-height: 46px; border-radius: 12px; background: var(--bg-elevated); border: 1px solid var(--border-subtle); font-weight: 800; letter-spacing: .6px; font-size: 13px; color: var(--text-muted); }
+.cr-tabs button.on { background: var(--text-main); color: #000; border-color: var(--text-main); }
+.cr-seg button[disabled], .cr-seg button.off { opacity: .4; cursor: not-allowed; }
+
+/* ---- skippable sponsored ads (pre-roll / mid-roll) ---- */
+.w-stage { position: relative; }
+.ad-layer { position: absolute; inset: 0; z-index: 8; background: #000; border-radius: inherit; overflow: hidden; animation: fade .18s ease; }
+.ad-layer video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+.ad-layer .ad-top { position: absolute; top: 10px; left: 10px; right: 10px; display: flex; align-items: center; gap: 8px; }
+.ad-layer .ad-t { color: #fff; font-size: 12px; font-weight: 600; text-shadow: 0 1px 4px #000; }
+.ad-layer .ad-bot { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 12px; background: linear-gradient(transparent, rgba(0,0,0,.7)); }
+.ad-skip { min-height: 40px; padding: 0 16px; border-radius: 999px; background: rgba(0,0,0,.65); border: 1px solid rgba(255,255,255,.35); color: #fff; font-weight: 700; font-size: 13px; }
+.ad-skip:disabled { opacity: .7; }
+.ad-skip:not(:disabled):hover { background: rgba(255,255,255,.14); }

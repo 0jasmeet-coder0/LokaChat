@@ -114,6 +114,7 @@
   window.LokaApi = {
     configured, ApiError, request, setToken, upload, removeFiles, publicUrl, subscribe, unsubscribe,
     hasToken: () => !!token,
+    getToken: () => token,   // v7: the account switcher stores each account's session token
     apiRoot,
     isNative,
     onUnauthorized: (fn) => { onUnauthorized = fn; },

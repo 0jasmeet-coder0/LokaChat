@@ -1,8 +1,8 @@
 /* LokaChat service worker - caches ONLY the same-origin static app shell.
    Never touches: /api calls, Supabase (REST, Storage, Realtime websockets), non-GET requests,
    range/media requests, or any cross-origin URL (CDN, iTunes, images). Bump VERSION to refresh. */
-const VERSION = "lokachat-shell-v6";
-const SHELL = ["./", "index.html", "style.css", "config.js", "crypto.js", "api.js", "core.js", "views.js", "watch.js", "chat.js", "you.js", "v6.js", "app.js", "manifest.json", "assets/icon-192.png", "assets/icon-512.png"];
+const VERSION = "lokachat-shell-v7-final";
+const SHELL = ["./", "index.html", "style.css", "config.js", "crypto.js", "api.js", "core.js", "views.js", "watch.js", "chat.js", "you.js", "v6.js", "auth.js", "app.js", "manifest.json", "assets/icon-192.png", "assets/icon-512.png"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => Promise.all(SHELL.map((u) => c.add(u).catch(() => {})))).then(() => self.skipWaiting()));

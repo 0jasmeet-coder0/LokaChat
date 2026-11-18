@@ -33,6 +33,22 @@ def check_uuid(v: str) -> str:
 
 Code = Field(pattern=r"^\d{6}$")
 CTA_LABELS = ("Watch", "Visit site", "Learn more")
+# v7: post `format` is derived from the upload type (the Create studio picks the type from the file)
+FORMAT_BY_TYPE = {"video": "video", "clip": "reel", "photo": "post", "community": "post", "story": "post"}
+
+
+def clean_username(v: str) -> str:
+    v = v.strip().lower().lstrip("@")
+    if not USERNAME_RE.match(v):
+        raise ValueError("Username must be 3-20 characters: letters, numbers, . or _")
+    return v
+
+
+def clean_display_name(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("Display name is required")
+    return v
 
 
 class SignupIn(BaseModel):
@@ -44,10 +60,7 @@ class SignupIn(BaseModel):
     @field_validator("username")
     @classmethod
     def _username(cls, v: str) -> str:
-        v = v.strip().lower().lstrip("@")
-        if not USERNAME_RE.match(v):
-            raise ValueError("Username must be 3-20 characters: letters, numbers, . or _")
-        return v
+        return clean_username(v)
 
     @field_validator("contact")
     @classmethod
@@ -57,10 +70,7 @@ class SignupIn(BaseModel):
     @field_validator("display_name")
     @classmethod
     def _dn(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Display name is required")
-        return v
+        return clean_display_name(v)
 
     @field_validator("password")
     @classmethod
@@ -68,6 +78,28 @@ class SignupIn(BaseModel):
         if len(v.encode()) > 72:  # bcrypt limit
             raise ValueError("Password is too long (max 72 bytes)")
         return v
+
+
+class GoogleIn(BaseModel):
+    """v7: the Supabase Auth access token the browser got after 'Continue with Google' (verified server-side)."""
+    access_token: str = Field(min_length=20, max_length=4000)
+
+
+class GoogleSetupIn(BaseModel):
+    """v7: onboarding for a brand-new Google user - they pick @username + display name."""
+    setup_token: str = Field(min_length=20, max_length=4000)
+    username: str
+    display_name: str = Field(min_length=1, max_length=40)
+
+    @field_validator("username")
+    @classmethod
+    def _username(cls, v: str) -> str:
+        return clean_username(v)
+
+    @field_validator("display_name")
+    @classmethod
+    def _dn(cls, v: str) -> str:
+        return clean_display_name(v)
 
 
 class LoginIn(BaseModel):
@@ -130,6 +162,14 @@ class PostCreate(BaseModel):
     is_sponsored: bool = False                                  # v6: creator promotes this upload as a Sponsored ad
     cta_label: str = Field(default="", max_length=24)           # v6: Watch / Visit site / Learn more
     cta_url: str = Field(default="", max_length=400)            # v6: https link for the CTA button (optional for 'Watch')
+    format: Optional[Literal["video", "reel", "post"]] = None   # v7: omitted = derived from type; must match the type if sent
+    allow_download: bool = True                                 # v7: creator can hide the Download button
+    ad_placement: Literal["none", "feed", "preroll", "midroll"] = "none"   # v7: where the promoted post is shown
+    ad_budget: float = Field(default=0, ge=0, le=1_000_000)     # v7: creator-declared budget (no payments are processed)
+
+    @field_validator("ad_budget")
+    @classmethod
+    def _budget(cls, v): return round(v, 2)
 
     @field_validator("music")
     @classmethod

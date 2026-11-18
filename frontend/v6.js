@@ -217,9 +217,13 @@
   };
 
   // ============================================================ + Create studio
-  const PRESETS = { video: ["Upload video", "video/*,image/*"], post: ["Create post", "image/*"], story: ["Create story", "image/*,video/*"] };
+  // v7: three formats (POST | STORY | REEL) with automatic format detection from the file.
+  const PRESETS = { post: ["Create post", "image/*"], story: ["Create story", "image/*,video/*"], reel: ["Create a reel or video", "video/*"] };
+  const TAB_LABEL = { post: "POST", story: "STORY", reel: "REEL" };
   const MAX_BYTES = 50 * 1024 * 1024;
   const extOf = (file) => (file.name.split(".").pop() || file.type.split("/")[1] || "bin").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 5) || "bin";
+  /** The upload "type" the backend wants, derived from the chosen tab + file + its shape. */
+  const kindFor = (tab, isImg, info) => tab === "story" ? "story" : tab === "post" ? (isImg ? "photo" : "community") : (isImg ? null : (info && info.h > info.w ? "clip" : "video"));
 
   const probeMedia = (f, url) => new Promise((resolve) => {
     if (f.type.startsWith("image/")) {
@@ -280,8 +284,9 @@
     if (st.kind === "clip") return "9:16 Vertical Reel";
     if (st.kind === "video") return Math.abs((i.w / (i.h || 1)) - 16 / 9) < 0.18 ? "16:9 Video" : "Video";
     if (st.kind === "photo") return "Image post";
-    if (st.kind === "community") return "Community post";
-    return "24h Story";
+    if (st.kind === "community") return "Text post";
+    if (st.kind === "story") return "24h Story";
+    return "Ready to publish";
   };
   const aspectOf = (st) => {
     const i = st.info || {};
@@ -292,39 +297,55 @@
   };
 
   App.openCreate = (preset) => {
-    preset = PRESETS[preset] ? preset : "video";
-    const st = { preset, file: null, kind: null, info: null, url: null, coverT: null, music: null, story: false, ad: false, cta: "Watch", crop: "orig", fit: false };
+    preset = preset === "video" ? "reel" : PRESETS[preset] ? preset : "reel";   // legacy "video" preset = the REEL tab
+    const st = { tab: preset, file: null, kind: null, info: null, url: null, coverT: null, music: null, story: false, dl: true, ad: false, adp: "feed", cta: "Watch", crop: "orig", fit: false };
     const [heading, accept] = PRESETS[preset];
     const m = modal(`<h3>${heading}</h3><form data-form="create-studio" style="display:grid;gap:14px">
-      ${preset === "post" ? `<div class="field"><label>What's on your mind?</label><textarea name="caption" maxlength="1000" placeholder="Share an update with your followers"></textarea></div>` : ""}
       <div id="cr-media"></div>
-      <div id="cr-fields" ${preset === "post" ? "" : "hidden"} style="display:grid;gap:14px">
+      <div id="cr-fields" hidden style="display:grid;gap:14px">
         <div class="field" id="f-title" hidden><label>Title</label><input name="title" maxlength="100" placeholder="Give it a title" autocomplete="off"></div>
-        ${preset === "post" ? "" : `<div class="field"><label>${preset === "story" ? "Caption (optional)" : "Description (optional)"}</label><textarea name="caption" maxlength="500"></textarea></div>`}
-        <div class="field" id="f-vis" ${preset === "post" ? "" : "hidden"}><label>Who can see it</label><select name="visibility"><option value="public">Everyone</option><option value="followers">Followers only</option></select></div>
+        <div class="field" id="f-cap"><label>Description (optional)</label><textarea name="caption" maxlength="1000"></textarea></div>
+        <div class="field" id="f-vis" hidden><label>Who can see it</label><select name="visibility"><option value="public">Everyone</option><option value="followers">Followers only</option></select></div>
         <div id="f-music" hidden></div>
         <div id="f-toggles" hidden>
           <div class="sw-row"><div><b>Share as 24h Story</b><small>Also posts it to your story for 24 hours</small></div><label class="switch"><input type="checkbox" data-cr="story"><i></i></label></div>
-          <div class="sw-row"><div><b>Promote as Sponsored Ad</b><small>Shown with a Sponsored badge in Home and Reels</small></div><label class="switch"><input type="checkbox" data-cr="ad"><i></i></label></div>
-          <div class="cr-ctas" id="cr-cta" hidden><div class="cr-seg" id="cr-cta-seg">${["Watch", "Visit site", "Learn more"].map((c, i) => `<button type="button" data-cta="${c}" class="${i === 0 ? "on" : ""}">${c}</button>`).join("")}</div>
-            <input name="cta_url" id="cr-cta-url" placeholder="https://yoursite.com (needed for Visit site / Learn more)" hidden autocomplete="off"></div>
+          <div class="sw-row"><div><b>Allow downloads</b><small>Lets viewers download this video to their device</small></div><label class="switch"><input type="checkbox" data-cr="dl" checked><i></i></label></div>
+          <div class="sw-row"><div><b>Promote as Sponsored Ad</b><small>Shown with a Sponsored badge in feeds and the player</small></div><label class="switch"><input type="checkbox" data-cr="ad"><i></i></label></div>
+          <div class="cr-ctas" id="cr-cta" hidden>
+            <label class="muted small">Where should the ad show?</label>
+            <div class="cr-seg" id="cr-adseg">${[["feed", "Feed"], ["preroll", "Pre-Roll"], ["midroll", "Mid-Roll"]].map(([v, l]) => `<button type="button" data-adp="${v}" class="${v === "feed" ? "on" : ""}">${l} Ad</button>`).join("")}</div>
+            <label class="muted small">Call to action</label>
+            <div class="cr-seg" id="cr-cta-seg">${["Watch", "Visit site", "Learn more"].map((c, i) => `<button type="button" data-cta="${c}" class="${i === 0 ? "on" : ""}">${c}</button>`).join("")}</div>
+            <input name="cta_url" id="cr-cta-url" placeholder="https://yoursite.com (needed for Visit site / Learn more)" hidden autocomplete="off">
+            <input name="ad_budget" type="number" min="0" step="1" placeholder="Budget in USD (optional)" autocomplete="off">
+          </div>
         </div>
       </div>
       <div class="cr-prog" id="cr-prog" hidden><b></b></div>
+      <div class="cr-tabs" id="cr-tabs" role="tablist">${["post", "story", "reel"].map((t) => `<button type="button" role="tab" data-cr-tab="${t}">${TAB_LABEL[t]}</button>`).join("")}</div>
       <div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Cancel</button><button class="btn primary" type="submit">Publish</button></div></form>`,
       { cls: "wide", noFocus: true, onClose: () => { if (st.url) URL.revokeObjectURL(st.url); App.stopClip(); } });
     const form = $("form", m.el);
     form._st = st; form._m = m;
     const media = $("#cr-media", m.el);
 
+    const paintTabs = () => $$("#cr-tabs button", m.el).forEach((b) => b.classList.toggle("on", b.dataset.crTab === st.tab));
+    /** Pre-roll / Mid-Roll ads are video-only (the backend rejects them for reels and photos). */
+    const paintAd = () => {
+      const box = $("#cr-cta", m.el); if (!box) return;
+      box.hidden = !st.ad;
+      if (st.ad && st.kind !== "video" && st.adp !== "feed") st.adp = "feed";
+      $$("#cr-adseg button", m.el).forEach((b) => { const off = b.dataset.adp !== "feed" && st.kind !== "video"; b.disabled = off; b.classList.toggle("off", off); b.classList.toggle("on", b.dataset.adp === st.adp); });
+    };
     const syncFields = () => {
       const k = st.kind, has = !!st.file;
-      $("#cr-fields", m.el).hidden = !(has || preset === "post");
+      $("#cr-fields", m.el).hidden = !(has || k === "community");
       $("#f-title", m.el).hidden = !["video", "clip", "photo"].includes(k);
-      $("#f-vis", m.el).hidden = !(["video", "photo"].includes(k) || (preset === "post" && k !== "story"));
+      $("#f-cap", m.el).querySelector("label").textContent = k === "community" ? "What's on your mind?" : k === "story" ? "Caption (optional)" : "Description (optional)";
+      $("#f-vis", m.el).hidden = !["video", "photo"].includes(k);
       $("#f-music", m.el).hidden = !["clip", "story"].includes(k);
       $("#f-toggles", m.el).hidden = !["video", "clip", "photo"].includes(k);
-      paintMusic();
+      paintTabs(); paintMusic(); paintAd();
     };
     const paintMusic = () => {
       const box = $("#f-music", m.el); if (!box || box.hidden) return;
@@ -336,7 +357,8 @@
     };
     const paintMedia = () => {
       if (!st.file) {
-        media.innerHTML = `<div class="cr-drop" data-cr="drop">${icon("add")}<b>${preset === "post" ? "Add a photo (optional)" : "Drag and drop a photo or video"}</b><span>or click to select a file (max 50 MB)</span><input type="file" accept="${accept}" hidden></div>`;
+        const drop = st.tab === "post" ? "Add a photo (optional)" : st.tab === "reel" ? "Drag and drop a video" : "Drag and drop a photo or video";
+        media.innerHTML = `<div class="cr-drop" data-cr="drop">${icon("add")}<b>${drop}</b><span>or click to select a file (max 50 MB)</span><input type="file" accept="${accept}" hidden></div>`;
         return;
       }
       const i = st.info || {}, ar = aspectOf(st);
@@ -362,29 +384,45 @@
       if (!parts.length) { box.innerHTML = '<span class="muted small">Cover will be taken automatically.</span>'; return; }
       box.innerHTML = parts.join(""); st.coverT = Number($("button", box).dataset.t);
     };
+    /** Switch the target-format tab, validating it against the file we already have. */
+    const setTab = (tab) => {
+      if (!TAB_LABEL[tab] || tab === st.tab) return;
+      const isImg = !!(st.file && st.file.type.startsWith("image/")), isVid = !!(st.file && st.file.type.startsWith("video/"));
+      if (st.file && tab === "reel" && !isVid) { toast("Reels need a video file", "err"); return; }
+      if (st.file && tab === "post" && !isImg) { toast("Posts use a photo - remove the video to make a text post", "err"); return; }
+      st.tab = tab;
+      st.kind = kindFor(tab, isImg, st.info);
+      if (tab !== "reel") { st.crop = "orig"; st.fit = false; }
+      paintMedia(); syncFields();
+      if (st.info && st.info.isVideo && st.kind && st.kind !== "story") makeCovers();
+    };
     const setFile = async (f) => {
       if (!f) return;
       if (f.size > MAX_BYTES) { toast("That file is over 50 MB", "err"); return; }
       const isImg = f.type.startsWith("image/"), isVid = f.type.startsWith("video/");
       if (!isImg && !isVid) { toast("Choose a photo or video", "err"); return; }
-      if (preset === "post" && !isImg) { toast("Posts can include an image", "err"); return; }
       if (st.url) URL.revokeObjectURL(st.url);
       Object.assign(st, { file: f, url: URL.createObjectURL(f), coverT: null, crop: "orig", fit: false });
       st.info = await probeMedia(f, st.url);
-      st.kind = preset === "story" ? "story" : isImg ? (preset === "post" ? "community" : "photo") : st.info.h > st.info.w ? "clip" : "video";
+      // auto-format detection: a photo belongs to POST, a video to REEL (stories accept both)
+      if (st.tab !== "story") { const want = isImg ? "post" : "reel"; if (st.tab !== want) { st.tab = want; toast(isImg ? "Photo detected - switched to POST" : "Video detected - switched to REEL"); } }
+      st.kind = kindFor(st.tab, isImg, st.info);
       paintMedia(); syncFields();
-      if (st.info.isVideo && st.kind !== "story") makeCovers();
+      if (st.info.isVideo && st.kind && st.kind !== "story") makeCovers();
     };
     paintMedia(); syncFields();
 
     // ---- local event wiring (the modal owns its own DOM)
     m.el.addEventListener("click", (e) => {
-      const t = e.target.closest("[data-cr],[data-cta],[data-crop],#cr-covers button"); if (!t) return;
+      const tabBtn = e.target.closest("[data-cr-tab]");
+      if (tabBtn) { setTab(tabBtn.dataset.crTab); return; }
+      const t = e.target.closest("[data-cr],[data-cta],[data-adp],[data-crop],#cr-covers button"); if (!t) return;
       if (t.dataset.cr === "drop") { const inp = $("input[type=file]", t); if (inp && e.target !== inp) inp.click(); }
-      else if (t.dataset.cr === "change") { st.file = null; st.kind = null; if (st.url) URL.revokeObjectURL(st.url); st.url = null; paintMedia(); syncFields(); }
+      else if (t.dataset.cr === "change") { st.file = null; st.kind = kindFor(st.tab, false, null); if (st.url) URL.revokeObjectURL(st.url); st.url = null; paintMedia(); syncFields(); }
       else if (t.dataset.cr === "fit") { st.fit = !st.fit; paintMedia(); if (st.info && st.info.isVideo && st.kind !== "story") makeCovers(); }
       else if (t.dataset.cr === "music") App.musicLibrary({ title: st.kind === "story" ? "Add music to your story" : "Add music to your reel", onPick: (tr) => { st.music = tr; paintMusic(); } });
       else if (t.dataset.cr === "music-x") { st.music = null; paintMusic(); }
+      else if (t.dataset.adp) { if (t.disabled) return; st.adp = t.dataset.adp; paintAd(); }
       else if (t.dataset.cta) { st.cta = t.dataset.cta; $$("#cr-cta-seg button", m.el).forEach((b) => b.classList.toggle("on", b === t)); $("#cr-cta-url", m.el).hidden = st.cta === "Watch"; }
       else if (t.dataset.crop) { st.crop = t.dataset.crop; paintMedia(); if (st.info && st.info.isVideo) makeCovers(); }
       else if (t.closest("#cr-covers")) { st.coverT = Number(t.dataset.t); $$("#cr-covers button", m.el).forEach((b) => b.classList.toggle("on", b === t)); }
@@ -393,7 +431,8 @@
       const t = e.target;
       if (t.type === "file") setFile(t.files[0]);
       else if (t.dataset && t.dataset.cr === "story") st.story = t.checked;
-      else if (t.dataset && t.dataset.cr === "ad") { st.ad = t.checked; $("#cr-cta", m.el).hidden = !st.ad; }
+      else if (t.dataset && t.dataset.cr === "dl") st.dl = t.checked;
+      else if (t.dataset && t.dataset.cr === "ad") { st.ad = t.checked; paintAd(); }
     });
     m.el.addEventListener("dragover", (e) => { const d = e.target.closest(".cr-drop"); if (d) { e.preventDefault(); d.classList.add("over"); } });
     m.el.addEventListener("dragleave", (e) => { const d = e.target.closest(".cr-drop"); if (d) d.classList.remove("over"); });
@@ -404,14 +443,15 @@
   const musicString = (t) => (t ? JSON.stringify({ title: t.title, artist: t.artist, url: t.url, cover: t.cover || "", start: t.start || 0, len: t.len || 0 }) : "");
 
   App.forms["create-studio"] = async (form, data) => {
-    const st = form._st, m = form._m, preset = st.preset;
-    const kind = st.kind || (preset === "post" ? "community" : null);
-    if (!kind) throw new Error("Choose a photo or video first");
+    const st = form._st, m = form._m;
+    const kind = st.kind || (st.tab === "post" ? "community" : null);
+    if (!kind) throw new Error(st.tab === "reel" ? "Add a video first" : "Choose a photo or video first");
     const caption = (data.caption || "").trim(), title = (data.title || "").trim();
     if (kind === "community" && !caption) throw new Error("Write something to share");
     if (["video", "clip", "photo"].includes(kind) && !title) throw new Error("Give it a title");
     const ctaUrl = (data.cta_url || "").trim();
     if (st.ad && st.cta !== "Watch" && !isHttps(ctaUrl)) throw new Error("Add an https:// link for the '" + st.cta + "' button");
+    const format = kind === "clip" ? "reel" : kind === "video" ? "video" : "post";   // v7: explicit format
     const btn = form.querySelector("button[type=submit]"), prog = $("#cr-prog", m.el), bar = $("b", prog);
     const step = (p, label) => { prog.hidden = false; bar.style.width = p + "%"; btn.textContent = label; };
     const uploaded = [], f = st.file, music = musicString(kind === "clip" || kind === "story" ? st.music : null);
@@ -434,9 +474,13 @@
       step(60, "Publishing...");
       const body = {
         type: kind, title, caption, visibility: kind === "story" || kind === "clip" ? "public" : data.visibility || "public",
+        format, allow_download: ["video", "clip"].includes(kind) ? !!st.dl : true,
         media_path: mediaPath, poster_path: posterPath, mime, music, duration: Math.round((duration || 0) * 10) / 10, size: blob ? blob.size || 0 : 0,
       };
-      if (st.ad && ["video", "clip", "photo"].includes(kind)) Object.assign(body, { is_sponsored: true, cta_label: st.cta, cta_url: st.cta === "Watch" ? "" : ctaUrl });
+      if (st.ad && ["video", "clip", "photo"].includes(kind)) {
+        const placement = kind === "video" ? st.adp : "feed";   // pre-roll / mid-roll are video-only
+        Object.assign(body, { is_sponsored: true, cta_label: st.cta, cta_url: st.cta === "Watch" ? "" : ctaUrl, ad_placement: placement, ad_budget: Math.max(0, Number(data.ad_budget) || 0) });
+      }
       post = await api.post("/posts/create", body);
       if (st.story && f && ["video", "clip", "photo"].includes(kind)) {
         step(80, "Adding to your story...");
@@ -465,7 +509,7 @@
     fresh: true,
     mount(pane) {
       pane.innerHTML = `<div class="page narrow"><div class="page-head"><h2>Create</h2></div><div class="cr-launch">
-        <button data-action="create-type" data-type="video">${icon("clips")}Upload video<small>Videos and reels - we detect 16:9 or 9:16 automatically</small></button>
+        <button data-action="create-type" data-type="reel">${icon("clips")}Create a reel<small>Vertical 9:16 reels - the format tab auto-detects your file</small></button>
         <button data-action="create-type" data-type="post">${icon("image")}Create post<small>Text updates with an optional photo</small></button>
         <button data-action="create-type" data-type="story">${icon("clock")}Create story<small>Photo or video that lasts 24 hours</small></button></div></div>`;
     },
@@ -473,7 +517,7 @@
   App.actions["create-type"] = (el) => {
     App.closeMenus();
     const t = el.dataset.type;
-    App.openCreate(t === "story" ? "story" : t === "community" || t === "post" ? "post" : "video");
+    App.openCreate(t === "story" ? "story" : t === "community" || t === "post" ? "post" : "reel");
   };
   App.actions["add-story"] = (el, ev) => { if (ev) ev.stopPropagation(); App.openCreate("story"); };
 
@@ -508,7 +552,7 @@
       if (f) {
         if (f.classList.contains("sent") || f.dataset.busy) return;
         f.dataset.busy = "1";
-        const ok = await App.sendToUser(f.dataset.u, { k: "share", t: (p.title || p.caption || "Post").slice(0, 90), pid: p.id, ty: p.type, th: App.postThumb(p) || "" });
+        const ok = await App.sendToUser(f.dataset.u, { k: "share", t: (p.title || p.caption || "Post").slice(0, 90), pid: p.id, ty: p.type, fmt: p.format || (p.type === "clip" ? "reel" : "video"), th: App.postThumb(p) || "" });
         delete f.dataset.busy; if (ok) f.classList.add("sent");
       } else if (b) {
         const k = b.dataset.sh;
@@ -519,7 +563,13 @@
       }
     });
   };
-  App.actions["open-shared"] = (el) => { const id = el.dataset.pid; if (/^[0-9a-f-]{36}$/i.test(id || "")) { App.closeAllModals(); App.go("/watch/" + id); } };
+  /** A shared Reel opens in the Reels player; a shared Video opens in the Theater player (strict by format). */
+  App.actions["open-shared"] = (el) => {
+    const id = el.dataset.pid; if (!/^[0-9a-f-]{36}$/i.test(id || "")) return;
+    const reel = el.dataset.fmt === "reel" || el.dataset.ty === "clip";
+    App.closeAllModals();
+    App.go(reel ? "/reels/" + id : "/watch/" + id);
+  };
 
   // ============================================================ Search: explore grid + filters
   const ex = { f: "all", q: "", users: [], posts: [], audios: [], seq: 0 };
@@ -660,39 +710,48 @@
     };
   };
 
-  /** Captions: real caption tracks when the video has them, otherwise Auto-CC via the Web Speech API (listens through the mic). */
-  let ccWarned = false;
+  /**
+   * Captions (CC): reads the video's OWN caption/subtitle tracks and shows the active cue.
+   * No microphone, no getUserMedia, no Web Speech API - if the video has no <track> we say so.
+   */
   App.attachCC = (root, v) => {
     const box = $(".vp-cc", root);
-    let rec = null, on = false, auto = false, hideT = 0;
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const show = (txt) => { box.innerHTML = txt ? `<span>${esc(txt)}</span>` : ""; box.classList.toggle("on", !!txt); clearTimeout(hideT); if (txt) hideT = setTimeout(() => { box.classList.remove("on"); }, 4500); };
-    const startRec = () => {
-      if (!SR || rec || !on || !auto) return;
-      rec = new SR(); rec.continuous = true; rec.interimResults = true; rec.lang = navigator.language || "en-US";
-      rec.onresult = (e) => { let t = ""; for (let i = e.resultIndex; i < e.results.length; i++) t += e.results[i][0].transcript; const words = t.trim().split(/\s+/); show(words.slice(-14).join(" ")); };
-      rec.onerror = (e) => { if (e.error === "not-allowed" || e.error === "service-not-allowed") { toast("Auto-CC needs microphone access to hear the video", "err"); api_off(); } };
-      rec.onend = () => { rec = null; if (on && auto && !v.paused) startRec(); };
-      try { rec.start(); } catch (e) { rec = null; }
+    let on = false;
+    const ccTracks = () => Array.from(v.textTracks || []).filter((t) => t.kind === "captions" || t.kind === "subtitles");
+    const cueText = () => {
+      let txt = "";
+      ccTracks().forEach((t) => {
+        if (t.mode !== "showing" || !t.activeCues) return;
+        for (let i = 0; i < t.activeCues.length; i++) { const c = t.activeCues[i]; if (c && c.text) txt += (txt ? " " : "") + c.text; }
+      });
+      return txt.trim();
     };
-    const stopRec = () => { if (rec) { const r = rec; rec = null; r.onend = null; try { r.stop(); } catch (e) { /* ignore */ } } };
-    const api_off = () => { on = false; stopRec(); show(""); const b = $("[data-p=cc]", root); if (b) b.classList.remove("on"); };
-    v.addEventListener("play", () => { if (on && auto) startRec(); });
-    v.addEventListener("pause", stopRec);
-    v.addEventListener("ended", stopRec);
+    const paint = () => {
+      if (!on) return;
+      const txt = cueText();
+      box.innerHTML = txt ? `<span>${esc(txt)}</span>` : "";
+      box.classList.toggle("on", !!txt);
+    };
+    const cueChange = () => paint();
+    ccTracks().forEach((t) => t.addEventListener("cuechange", cueChange));
+    v.addEventListener("timeupdate", paint);
+    const off = () => { on = false; ccTracks().forEach((t) => { t.mode = "hidden"; }); box.innerHTML = ""; box.classList.remove("on"); const b = $("[data-p=cc]", root); if (b) b.classList.remove("on"); };
     return {
       /** returns true when captions are now on */
       toggle() {
-        const tracks = Array.from(v.textTracks || []).filter((t) => t.kind === "captions" || t.kind === "subtitles");
-        if (tracks.length) { on = !on; auto = false; tracks.forEach((t) => { t.mode = on ? "showing" : "hidden"; }); return on; }
-        if (!SR) { toast("Auto-CC needs a browser with speech recognition (Chrome, Edge or Safari)", "err"); return false; }
-        if (on) { api_off(); return false; }
-        on = true; auto = true;
-        if (!ccWarned) { ccWarned = true; toast("Auto-CC listens through your microphone, so it works best with the sound on speakers."); }
-        if (!v.paused) startRec();
-        return true;
+        let tracks = ccTracks();
+        // a <track> element with kind=captions but not yet loaded into textTracks
+        if (!tracks.length) {
+          const el = v.querySelector && v.querySelector('track[kind="captions"],track[kind="subtitles"]');
+          if (el && el.track) tracks = [el.track];
+        }
+        if (!tracks.length) { toast("Captions not available for this video", "err"); return false; }
+        on = !on;
+        tracks.forEach((t) => { t.mode = on ? "showing" : "hidden"; });
+        if (on) { tracks.forEach((t) => t.addEventListener("cuechange", cueChange)); paint(); } else off();
+        return on;
       },
-      destroy() { api_off(); clearTimeout(hideT); },
+      destroy() { ccTracks().forEach((t) => t.removeEventListener("cuechange", cueChange)); v.removeEventListener("timeupdate", paint); box.innerHTML = ""; box.classList.remove("on"); },
     };
   };
 

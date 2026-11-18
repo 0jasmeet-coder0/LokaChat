@@ -161,7 +161,7 @@
           <button class="vp-b" data-p="pip" aria-label="Picture in picture">${icon("pip")}</button>
           <button class="vp-b" data-p="full" aria-label="Fullscreen">${icon("full")}</button></div></div></div>`;
     const root = $(".vplayer", box), v = $("video", root), seek = $(".vp-seek", root), vol = $(".vp-vol", root), time = $(".vp-time", root);
-    let dragging = false, idleT = 0, clickT = 0, lastSent = 0, counted = false, docked = false, dismissed = false;
+    let dragging = false, idleT = 0, clickT = 0, lastSent = 0, counted = false, docked = false, dismissed = false, releasedFromDrag = 0;
     const scaler = App.attachScaler(root, v, ({ q, effective }) => { const l = $("[data-m=quality]", root); if (l) l.textContent = q === "Auto" ? "Auto" + (effective ? " · " + effective + "p" : "") : q; });
     const cc = App.attachCC(root, v);
     const undock = () => { docked = false; root.classList.remove("mini"); box.style.minHeight = ""; };
@@ -178,14 +178,18 @@
       time.textContent = fmt(v.currentTime) + " / " + fmt(d);
       if (!dragging) { const f = d ? v.currentTime / d : 0; seek.value = String(Math.round(f * 1000)); setFill(seek, f); }
     };
-    const toggle = () => (v.paused ? v.play().catch(() => {}) : v.pause());
+    const toggle = () => { if (!preDone) { startPreRoll(); return; } v.paused ? v.play().catch(() => {}) : v.pause(); };
     const send = (count) => api.post("/posts/view", { post_id: p.id, position: v.currentTime || 0, duration: isFinite(v.duration) ? v.duration : p.duration || 0, count })
       .then((r) => { if (count && r && typeof r.views === "number") p.views = r.views; }).catch(() => {});
     v.addEventListener("play", () => { paintPlay(); if (!counted) { counted = true; send(true); } });
     v.addEventListener("pause", paintPlay);
     v.addEventListener("ended", () => { paintPlay(); send(false); });
     v.addEventListener("loadedmetadata", paintTime);
-    v.addEventListener("timeupdate", () => { paintTime(); if (Date.now() - lastSent > 10000) { lastSent = Date.now(); send(false); } });
+    v.addEventListener("timeupdate", () => {
+      paintTime();
+      if (!midDone && AD_PLACE === "midroll" && isFinite(v.duration) && v.duration && v.currentTime / v.duration >= 0.5) { midDone = true; try { v.pause(); } catch (er) { /* ignore */ } runAd(() => v.play().catch(() => {})); }
+      if (Date.now() - lastSent > 10000) { lastSent = Date.now(); send(false); }
+    });
     v.addEventListener("volumechange", () => { $("[data-p=mute]", root).innerHTML = icon(v.muted || v.volume === 0 ? "mute" : "volume"); });
     v.addEventListener("error", () => toast("This video couldn't be played", "err"));
     seek.addEventListener("input", () => { dragging = true; const d = v.duration || 0; if (d) v.currentTime = (seek.value / 1000) * d; setFill(seek, seek.value / 1000); });
@@ -209,7 +213,7 @@
       else if (k === "cc") { b.classList.toggle("on", cc.toggle()); }
       else if (k === "mini-play") toggle();
       else if (k === "mini-close") { dismissed = true; try { v.pause(); } catch (er) { /* ignore */ } undock(); }
-      else if (k === "mini-max") { undock(); box.scrollIntoView({ behavior: "smooth", block: "center" }); }
+      else if (k === "mini-max") { if (Date.now() - releasedFromDrag < 350) return; undock(); box.scrollIntoView({ behavior: "smooth", block: "center" }); }
       else if (k === "pip") {
         if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
         else if (v.requestPictureInPicture) v.requestPictureInPicture().catch(() => toast("Picture-in-picture isn't available here", "err"));
@@ -217,6 +221,62 @@
       }
       else if (k === "full") { document.fullscreenElement ? document.exitFullscreen() : (root.requestFullscreen ? root.requestFullscreen().catch(() => {}) : v.webkitEnterFullscreen && v.webkitEnterFullscreen()); }
     });
+    // ---- miniplayer: drag to any corner (pointer events cover mouse + touch), tap to maximize ----
+    const ctl = $(".mini-ctl", root);
+    let pdrag = null;
+    const clampXY = (x, y) => {
+      const w = root.offsetWidth || 220, h = root.offsetHeight || 124, pad = 8;
+      return { x: Math.min(Math.max(pad, x), Math.max(pad, window.innerWidth - w - pad)), y: Math.min(Math.max(pad, y), Math.max(pad, window.innerHeight - h - pad)) };
+    };
+    const place = (x, y) => { root.style.left = x + "px"; root.style.top = y + "px"; root.style.right = "auto"; root.style.bottom = "auto"; };
+    ctl.addEventListener("pointerdown", (e) => {
+      if (!root.classList.contains("mini")) return;
+      if (e.button && e.button !== 0) return;
+      if (e.target.closest("button")) return;                 // let the play / close buttons work
+      const r = root.getBoundingClientRect();
+      pdrag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: r.left, oy: r.top, moved: false };
+      try { ctl.setPointerCapture(e.pointerId); } catch (er) { /* ignore */ }
+      e.preventDefault();
+    });
+    ctl.addEventListener("pointermove", (e) => {
+      if (!pdrag || e.pointerId !== pdrag.id) return;
+      const dx = e.clientX - pdrag.sx, dy = e.clientY - pdrag.sy;
+      if (!pdrag.moved && Math.hypot(dx, dy) < 6) return;     // a small wobble is still a tap
+      if (!pdrag.moved) { pdrag.moved = true; root.classList.add("dragging", "dragged"); }
+      const pos = clampXY(pdrag.ox + dx, pdrag.oy + dy);
+      place(pos.x, pos.y);
+    });
+    const endDrag = (e) => {
+      if (!pdrag || (e && e.pointerId !== pdrag.id)) return;
+      const moved = pdrag.moved; pdrag = null;
+      root.classList.remove("dragging");
+      if (!moved) return;                                     // a tap -> the click handler maximizes
+      releasedFromDrag = Date.now();                          // suppress the click that follows the drag
+      const w = root.offsetWidth || 220, h = root.offsetHeight || 124, pad = 10;
+      const box2 = root.getBoundingClientRect();
+      const x = box2.left + w / 2 < window.innerWidth / 2 ? pad : window.innerWidth - w - pad;
+      const y = box2.top + h / 2 < window.innerHeight / 2 ? pad : window.innerHeight - h - pad;
+      place(x, y);                                            // snap to the nearest corner
+    };
+    ctl.addEventListener("pointerup", endDrag);
+    ctl.addEventListener("pointercancel", endDrag);
+    // ---- sponsored ads: skippable 5s pre-roll and mid-roll (only for sponsored videos) ----
+    const AD_PLACE = p.is_sponsored ? (p.ad_placement || "none") : "none";
+    let preDone = AD_PLACE !== "preroll", midDone = false, adTick = 0, adNode = null;
+    function runAd(done) {
+      if (adNode) return;
+      const wrap = document.createElement("div");
+      wrap.innerHTML = `<div class="ad-layer"><div class="ad-top"><span class="spons">Sponsored</span><span class="ad-t ellipsis">${esc(p.title || "Promoted")} · ${esc(p.author.display_name)}</span></div>${p.poster_url ? `<img alt="" src="${esc(p.poster_url)}" style="width:100%;height:100%;object-fit:contain;background:#000">` : ""}<div class="ad-bot"><span class="ad-t" data-adcount>Ad · 5s</span><button type="button" class="ad-skip" data-p="ad-skip" disabled>Skip in 5</button></div></div>`;
+      adNode = wrap.firstElementChild; root.appendChild(adNode);
+      const skip = $("[data-p=ad-skip]", adNode), count = $("[data-adcount]", adNode);
+      let left = 5, finished = false;
+      const paint = () => { skip.textContent = left > 0 ? "Skip in " + left : "Skip Ad"; skip.disabled = left > 0; if (count) count.textContent = left > 0 ? "Ad · " + left + "s" : "Skip to continue"; };
+      const finish = () => { if (finished) return; finished = true; clearInterval(adTick); if (adNode) { adNode.remove(); adNode = null; } if (done) done(); };
+      paint();
+      adTick = setInterval(() => { left -= 1; paint(); if (left <= 0) { clearInterval(adTick); setTimeout(finish, 2000); } }, 1000);
+      skip.addEventListener("click", () => { if (!skip.disabled) finish(); });
+    }
+    function startPreRoll() { if (preDone || adNode) return; try { v.pause(); } catch (er) { /* ignore */ } runAd(() => { preDone = true; v.play().catch(() => {}); }); }
     const key = (e) => {
       if (S.route !== "watch" || /INPUT|TEXTAREA|SELECT/.test((e.target.tagName || "")) && e.target.type !== "range") return;
       if (e.key === " " || e.key === "k") { e.preventDefault(); toggle(); }
@@ -235,9 +295,13 @@
         const on = want && !dismissed && (v.currentTime > 0 || !v.paused);
         if (on === docked) return;
         if (on) box.style.minHeight = box.getBoundingClientRect().height + "px";
-        docked = on; root.classList.toggle("mini", on); if (!on) box.style.minHeight = "";
+        docked = on; root.classList.toggle("mini", on);
+        // always re-anchor to the default corner (clears any inline drag position)
+        root.classList.remove("dragging", "dragged");
+        root.style.left = root.style.top = root.style.right = root.style.bottom = "";
+        if (!on) box.style.minHeight = "";
       },
-      destroy() { scaler.destroy(); cc.destroy(); document.removeEventListener("keydown", key); clearTimeout(clickT); clearTimeout(idleT); try { v.pause(); } catch (e) { /* ignore */ } if (counted) send(false); v.removeAttribute("src"); v.load(); },
+      destroy() { scaler.destroy(); cc.destroy(); document.removeEventListener("keydown", key); clearTimeout(clickT); clearTimeout(idleT); clearInterval(adTick); if (adNode) { adNode.remove(); adNode = null; } try { v.pause(); } catch (e) { /* ignore */ } if (counted) send(false); v.removeAttribute("src"); v.load(); },
     };
   }
   App.makePlayer = makePlayer;
@@ -262,6 +326,7 @@
         <span class="grow"></span>
         <div class="w-actions">${App.likeBtn(p)}<button class="chip-btn ${disliked.has(p.id) ? "liked" : ""}" data-action="dislike" data-id="${esc(p.id)}" aria-label="Dislike">${icon("thumbdown")}</button>
           <button class="chip-btn" data-action="share" data-id="${esc(p.id)}">${icon("share")}<span class="n">Share</span></button>${App.saveBtn(p)}
+          ${vid && p.allow_download !== false ? `<button class="chip-btn" data-action="download-post" data-id="${esc(p.id)}">${icon("download")}<span class="n">Download</span></button>` : ""}
           ${p.author.id === S.user.id ? `<button class="chip-btn" data-action="delete-post" data-id="${esc(p.id)}">${icon("trash")}</button>` : ""}</div></div>
       <div class="w-desc card"><b>${App.num(p.views)} views · ${App.timeAgo(p.created_at)}</b>${p.music ? `<div class="muted small">♪ ${esc(App.musicLabel(p.music))}</div>${(() => { const mt = App.parseMusic(p.music); return mt && mt.url ? App.audioChip(mt.url, { start: mt.start, len: mt.len, label: "clip" }) : ""; })()}` : ""}<p>${p.caption ? esc(p.caption) : '<span class="muted">No description.</span>'}</p></div>
       <section class="w-comments" id="w-comments"></section></div>
@@ -275,6 +340,25 @@
     else if (p.media_url) { stage.innerHTML = `<img class="w-img" src="${esc(p.media_url)}" alt="${esc(p.title)}" data-dbl="like-post" data-id="${esc(p.id)}">`; api.post("/posts/view", { post_id: p.id, count: true }).catch(() => {}); }
     App.mountComments($("#w-comments", pane), p.id);
   }
+  /** Download the video file - only offered when the creator allowed downloads. */
+  App.actions["download-post"] = async (el) => {
+    const p = postOf(el.dataset.id);
+    if (!p || !p.media_url || p.allow_download === false) { toast("Downloads are off for this video", "err"); return; }
+    const name = (p.title || "loka-video").replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 60) || "loka-video";
+    try {
+      const res = await fetch(p.media_url);
+      if (!res.ok) throw new Error("Download failed (" + res.status + ")");
+      const blob = await res.blob(), ext = (blob.type.split("/")[1] || "mp4").split(";")[0];
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob); a.download = name + "." + ext;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      toast("Downloading…");
+    } catch (e) {
+      // cross-origin fetch blocked: fall back to opening the file so the browser can save it
+      try { window.open(p.media_url, "_blank", "noopener"); } catch (er) { fail(e, "Couldn't download"); }
+    }
+  };
   App.actions.dislike = (el) => {
     const id = el.dataset.id, on = !disliked.has(id);
     on ? disliked.add(id) : disliked.delete(id);
@@ -343,6 +427,12 @@
     reelLoadIO = new IntersectionObserver((entries) => entries.forEach((en) => { if (en.isIntersecting) { const v = $("video", en.target); if (!v.src) { v.preload = "metadata"; v.src = v.dataset.src; } } }), { root: wrap, rootMargin: "100% 0px" });
     $$(".reel", wrap).forEach((r) => { reelIO.observe(r); reelLoadIO.observe(r); });
   }
+  /** Scroll the Reels player to a specific clip (used when a shared reel is opened from a chat). */
+  function focusReel(id) {
+    const wrap = $("#reels"); if (!wrap || !id) return;
+    const el = $(`.reel[data-id="${id}"]`, wrap); if (!el) { toast("That reel is no longer available"); return; }
+    wrap.scrollTop = el.offsetTop;
+  }
   const syncMute = () => $$("#reels .mute-ic").forEach((m) => { m.innerHTML = icon(S.muted ? "mute" : "volume"); });
   App.actions["reel-mute"] = () => { S.muted = !S.muted; reelVideos().forEach((v) => { v.muted = S.muted; }); if (App.muteClip) App.muteClip(S.muted); syncMute(); };
 
@@ -359,10 +449,12 @@
     },
     hide() { reelVideos().forEach((v) => v.pause()); App.stopClip(); },
     async show(ctx) {
+      const target = ctx.args[0] || null;
       const posts = await App.swr("feed:clips", async () => App.remember((await api.get("/posts/feed?tab=clips&limit=30")).posts), (d) => { if (S.route === "reels") paintReels(d); }, { fresh: 30000 });
       if (ctx.stale()) return;
       if (!$("#reels .reel") || !activeReel || !document.body.contains(activeReel)) paintReels(posts);
       else { const v = $("video", activeReel); if (v) { v.muted = S.muted; v.play().catch(() => {}); } }
+      if (target) focusReel(target);
     },
   };
   // make the clips feed prefetch with the rest

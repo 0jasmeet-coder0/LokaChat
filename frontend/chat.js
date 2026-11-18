@@ -24,6 +24,12 @@
   let replyTo = null;           // { id, n, p }
   let chatQuery = "";
 
+  /** v7: mobile full-screen chat - the bottom nav + top bar step aside (body.in-chat). */
+  const setInChat = (on) => document.body.classList.toggle("in-chat", !!on);
+  /** The "@username v" multi-account switcher button (shared by the Messages + Profile headers). */
+  const acctBtn = () => `<button class="acct-trigger" data-action="open-switcher" aria-haspopup="dialog" aria-label="Switch account"><span class="at">@</span><span class="acct-name">${esc(S.user.username)}</span><svg class="ic"><use href="#i-chevron-down"/></svg></button>`;
+  App.acctBtn = acctBtn;
+
   // ---------- helpers ----------
   const other = (chat) => chat.members.find((m) => m.id !== S.user.id) || chat.members[0] || {};
   const titleOf = (chat) => (chat.type === "direct" ? other(chat).display_name || "Chat" : chat.title || "Untitled");
@@ -82,7 +88,7 @@
   App.routes.messages = {
     mount(pane) {
       pane.innerHTML = `<div class="chat-wrap" id="chat-wrap"><div class="chat-list" id="chat-list">
-        <div class="chat-head"><h2 class="me-name">@${esc(S.user.username)}</h2><button class="icon-btn" data-action="new-chat" aria-label="New message" title="New message">${icon("edit")}</button></div>
+        <div class="chat-head">${acctBtn()}<span class="grow"></span><button class="icon-btn" data-action="new-group" aria-label="New group chat" title="New group chat">${icon("users")}</button><button class="icon-btn" data-action="new-chat" aria-label="New message" title="New message">${icon("edit")}</button></div>
         <div class="chat-search">${icon("search")}<input id="chat-q" type="search" placeholder="Search" autocomplete="off"></div>
         <div class="notes-row hscroll" id="notes-row"></div>
         <div class="tabs hscroll" id="msg-tabs">${["chats", "stories", "channels"].map((t) => `<button data-action="msg-tab" data-tab="${t}">${t[0].toUpperCase() + t.slice(1)}</button>`).join("")}</div>
@@ -93,6 +99,7 @@
     async show(ctx) {
       const id = ctx.args[0] || null;
       $("#chat-wrap").classList.toggle("has-conv", !!id);
+      setInChat(!!id);
       if (S.chats.length || App.cacheGet("chats")) { S.chats = App.cacheGet("chats") || S.chats; paintList(); }
       paintNotes();
       App.loadNotes().then(() => { if (!ctx.stale()) paintNotes(); }).catch(() => {});
@@ -103,6 +110,7 @@
       if (ctx.stale()) return;
       if (id) { const c = find(id); if (!c) { App.go("/messages"); return; } if (openId !== id || !$("#msgs")) openConv(c, ctx); }
     },
+    hide() { setInChat(false); },   // v7: leaving Messages restores the bottom nav + top bar
   };
   function paintEmptyConv() {
     const c = $("#conv"); if (!c) return;
@@ -283,8 +291,9 @@
     const q = chatQuery.toLowerCase();
     if (S.msgTab === "chats") {
       const chats = S.chats.filter((c) => c.type !== "channel" && (!q || titleOf(c).toLowerCase().includes(q) || (other(c).username || "").includes(q)));
-      box.innerHTML = (chats.length ? chats.map(row).join("") : q ? "" : App.emptyBox("chat", "No messages yet", "Send a private message to someone you know.", `<button class="btn primary" data-action="new-chat">Send message</button>`)) + (q.length >= 2 ? '<div id="chat-people"></div>' : "");
-      if (q.length >= 2) searchPeople(q);
+      box.innerHTML = (chats.length ? chats.map(row).join("") : q ? "" : App.emptyBox("chat", "No messages yet", "Send a private message to someone you know.", `<button class="btn primary" data-action="new-chat">Send message</button>`))
+        + (q.length >= 2 ? '<div id="chat-people"></div>' : '<div id="chat-suggest"></div>');
+      if (q.length >= 2) searchPeople(q); else loadSuggested();
     } else if (S.msgTab === "channels") {
       const mine = S.chats.filter((c) => c.type === "channel");
       box.innerHTML = (mine.length ? mine.map(row).join("") : "") + `<div class="muted small" style="padding:14px 10px 6px">Discover channels</div><div id="discover"><div class="spinner"></div></div>`;
@@ -303,6 +312,28 @@
       const box = $("#chat-people"); if (!box || my !== peopleSeq) return;
       box.innerHTML = users.length ? `<div class="muted small" style="padding:10px 10px 4px">People</div>` + users.filter((u) => !u.is_me).map((u) => `<div class="chat-item" data-action="dm" data-user="${esc(u.username)}">${avatar(u, "m")}<div class="grow"><b>${esc(u.display_name)}</b><div class="muted small">@${esc(u.username)}</div></div><span class="btn sm">Message</span></div>`).join("") : "";
     } catch (e) { /* ignore */ }
+  }
+  // "Suggested contacts / Accounts to follow" - people appear here based on who posts in Explore.
+  let suggLoaded = false;
+  async function loadSuggested() {
+    const paint = (posts) => {
+      const host = $("#chat-suggest"); if (!host) return;
+      const seen = new Set([S.user.username]), people = [];
+      posts.forEach((p) => {
+        const a = p.author || {};
+        if (!a.username || a.id === S.user.id || seen.has(a.username)) return;
+        seen.add(a.username); a.is_following = S.following.has(a.username); people.push(a);
+      });
+      people.sort((x, y) => (x.is_following ? 1 : 0) - (y.is_following ? 1 : 0));
+      host.innerHTML = people.length ? `<div class="sugg-h"><b>Suggested contacts</b><span class="muted small">Accounts to follow</span></div>
+        <div class="sugg-list">${people.slice(0, 8).map((u) => `<div class="sugg-row" data-action="open-profile" data-user="${esc(u.username)}">${avatar(u, "m")}<div class="grow"><b>${esc(u.display_name)}</b><span>@${esc(u.username)}</span></div>${App.followBtn(u)}</div>`).join("")}</div>` : "";
+    };
+    const host = $("#chat-suggest"); if (!host) return;
+    const cached = App.cacheGet("explore");
+    if (cached) paint(cached);
+    if (suggLoaded) return;
+    try { const r = await api.get("/posts/feed?tab=explore&limit=40"); App.remember(r.posts); suggLoaded = true; paint(r.posts); }
+    catch (e) { if (!cached) host.innerHTML = ""; }
   }
   async function loadDiscover() {
     try {
@@ -370,7 +401,7 @@
     let body;
     if (m.failed) body = `<span class="undec">Message from earlier session</span>`;
     else if (pl.k === "music") body = musicCard(pl);
-    else if (pl.k === "share") body = `<div class="m-share" data-action="open-shared" data-pid="${esc(pl.pid || "")}">${pl.th && /^https:\/\//.test(pl.th) ? `<img class="att-img" src="${esc(pl.th)}" alt="" loading="lazy">` : ""}<b>${esc(pl.t || "Shared post")}</b><span class="muted small">Tap to open</span></div>`;
+    else if (pl.k === "share") { const reel = pl.fmt === "reel" || pl.ty === "clip"; body = `<div class="m-share" data-action="open-shared" data-pid="${esc(pl.pid || "")}" data-fmt="${esc(pl.fmt || "")}" data-ty="${esc(pl.ty || "")}">${pl.th && /^https:\/\//.test(pl.th) ? `<img class="att-img" src="${esc(pl.th)}" alt="" loading="lazy">` : ""}<b>${esc(pl.t || "Shared post")}</b><span class="muted small">${icon(reel ? "clips" : "play")} Open in ${reel ? "Reels" : "Theater"} player</span></div>`; }
     else if (pl.k === "gif") body = pl.u ? `<img class="gif" src="${esc(pl.u)}" alt="${esc(pl.t || "GIF")}" loading="lazy">` : `<span class="sticker">${esc(pl.t)}</span>`;
     else if (pl.k === "image" || pl.k === "video" || pl.k === "audio" || pl.k === "voice") body = attHtml(m);
     else body = `<span class="txt">${esc(pl.t)}</span>`;
@@ -898,6 +929,24 @@
     // no per-device keys any more: the server just stores a placeholder, messages use the conversation key
     return api.post("/chats/create", { type, title, description, members: names.map((n) => ({ username: n, wrapped_key: "fb1" })), my_wrapped_key: "fb1" });
   }
+
+  // ---------- v7: dedicated "New group chat" composer ----------
+  App.actions["new-group"] = () => {
+    modal(`<h3>New group chat</h3><p class="muted small">Bring people together. Groups are end-to-end encrypted.</p><form data-form="new-group">
+      <div class="field"><label>Group name</label><input name="title" maxlength="60" placeholder="e.g. Weekend trip" required autofocus></div>
+      <div class="field"><label>Add people (usernames, comma separated)</label><input name="users" placeholder="e.g. priya, arjun" autocomplete="off" required></div>
+      <div class="field"><label>Description (optional)</label><input name="description" maxlength="200"></div>
+      <div class="modal-actions"><button class="btn primary" type="submit">Create group</button></div></form>`);
+  };
+  App.forms["new-group"] = async (form, data) => {
+    const users = (data.users || "").split(/[,\s]+/).filter(Boolean);
+    const res = await createChat("group", (data.title || "").trim(), (data.description || "").trim(), users);
+    App.closeAllModals();
+    await loadChats(true);
+    toast(res.existing ? "Opened your existing group" : "Group created");
+    S.msgTab = "chats";
+    App.go("/messages/" + res.id);
+  };
   App.forms["new-chat"] = async (form, data) => {
     const users = (data.users || "").split(/[,\s]+/).filter(Boolean);
     const res = await createChat(data.type, (data.title || "").trim(), (data.description || "").trim(), users);
@@ -934,7 +983,7 @@
   document.addEventListener("click", (e) => { const pop = $("#pill-pop"); if (pop && pop.classList.contains("open") && !e.target.closest("#msg-pill-wrap")) pop.classList.remove("open"); }, true);
 
   /** Called on logout: forget keys and cached plaintext. */
-  App.resetChat = () => { keyCache.clear(); msgStore.clear(); previews.clear(); attCache.forEach((u) => URL.revokeObjectURL(u)); attCache.clear(); openId = null; replyTo = null; chatQuery = ""; const p = $("#view [data-pane=messages]"); if (p) p.remove(); };
+  App.resetChat = () => { setInChat(false); suggLoaded = false; keyCache.clear(); msgStore.clear(); previews.clear(); attCache.forEach((u) => URL.revokeObjectURL(u)); attCache.clear(); openId = null; replyTo = null; chatQuery = ""; const p = $("#view [data-pane=messages]"); if (p) p.remove(); };
   /** After restoring keys, forget undecryptable results and re-render. */
   App.refreshChats = async () => { keyCache.clear(); msgStore.clear(); App.cacheDrop("chats", "msgs:"); await loadChats(true); const c = find(openId); if (c && S.route === "messages") openConv(c, {}); };
 })();
