@@ -45,8 +45,11 @@
     box.innerHTML = `<div class="profile-head" style="position:relative"><div class="ph-tools">${switcher}<button class="icon-btn set-mobile" data-action="open-settings" aria-label="Settings & Activity">${icon("gear")}</button></div>${avatar(u, "xl")}<div class="grow"><h2>${esc(u.display_name)}</h2><div class="muted">@${esc(u.username)}</div>
       <div class="stats"><div><b>${App.num(u.posts)}</b><span class="muted small">Posts</span></div><div><b>${App.num(u.followers)}</b><span class="muted small">Followers</span></div><div><b>${App.num(u.following)}</b><span class="muted small">Following</span></div></div>
       ${u.bio ? `<p class="bio">${esc(u.bio)}</p>` : ""}
-      <div class="row wrap"><button class="btn sm" data-action="edit-profile">Edit Profile</button><button class="btn sm" data-action="open-security">${icon("shield")}Security & 2FA</button>
-        <button class="btn sm danger" data-action="logout">${icon("logout")}Log out</button></div></div></div>`;
+      <div class="ph-actions">
+        <button class="btn sm" data-action="edit-profile">Edit profile</button>
+        <button class="btn sm" data-action="share-profile">Share profile</button>
+        <button class="btn sm icon" data-action="add-contact" aria-label="Add contact" title="Add contact">${icon("add")}</button>
+      </div></div></div>`;
   }
   function paintHistory() {
     const box = $("#you-hist"); if (!box) return;
@@ -118,17 +121,60 @@
       ${sec("App")}
       <div class="set-list">${row("toggle-pin", "pin", "Pin / collapse sidebar", "Desktop layout")}</div>
       <button class="btn danger block" style="margin-top:18px" data-action="logout">${icon("logout")}Log out</button>
-      <p class="muted small center" style="margin:18px 0 6px">LokaChat v7</p>`;
+      <p class="muted small center" style="margin:18px 0 6px">LokaChat v8</p>`;
   }
-  App.actions["open-privacy"] = () => modal(`<h3>Privacy</h3><div class="stack"><p class="muted">Your email and phone number are never shown on your profile.</p>
-    <p class="muted">Direct and group chats are end-to-end encrypted in your browser. Channels are public broadcasts and are not encrypted.</p>
-    <p class="muted">Posts set to "Followers only" are hidden from everyone else. Dislikes are private and stay on this device.</p>
-    <div class="modal-actions"><button class="btn" data-action="close-modal">Close</button></div></div>`);
+  // ============================================================ v8: privacy, blocking, safety
+  const seg = (field, value, opts) => `<div class="seg set-field" data-field="${field}">${opts.map(([v, l]) => `<button type="button" class="seg-b ${v === value ? "on" : ""}" data-action="privacy-set" data-field="${esc(field)}" data-value="${esc(v)}">${esc(l)}</button>`).join("")}</div>`;
+  App.actions["open-privacy"] = () => {
+    App.closeMenus();
+    const u = S.user;
+    modal(`<h3>Privacy &amp; safety</h3>
+      <div class="set-sec">Account</div>
+      <div class="field"><label>Who can see your posts</label>${seg("account_privacy", u.account_privacy || "public", [["public", "Public"], ["private", "Private"]])}
+        <small class="muted">Private accounts approve followers first, and only followers see their posts.</small></div>
+      <div class="field"><label>Who can message you</label>${seg("who_can_message", u.who_can_message || "everyone", [["everyone", "Everyone"], ["followers", "Followers"], ["nobody", "No one"]])}</div>
+      <div class="field"><label>Who can comment on your posts</label>${seg("who_can_comment", u.who_can_comment || "everyone", [["everyone", "Everyone"], ["followers", "Followers"], ["nobody", "No one"]])}</div>
+      <p class="muted small">Your email and phone number are never shown on your profile. Direct and group chats are end-to-end encrypted; channels are public broadcasts.</p>
+      <div class="set-sec">Blocked accounts</div>
+      <div id="pv-blocks"><div class="spinner"></div></div>
+      <div class="modal-actions"><button class="btn" data-action="close-modal">Done</button></div>`, { cls: "wide", noFocus: true });
+    loadBlocks();
+  };
+  App.actions["privacy-set"] = async (el) => {
+    const field = el.dataset.field, value = el.dataset.value, prev = S.user[field];
+    if (prev === value) return;
+    el.closest(".set-field").querySelectorAll(".seg-b").forEach((b) => b.classList.toggle("on", b === el));
+    S.user[field] = value;
+    try { const u = await api.patch("/users/me", { [field]: value }); S.user = { ...S.user, ...u }; }
+    catch (e) { S.user[field] = prev; el.closest(".set-field").querySelectorAll(".seg-b").forEach((b) => b.classList.toggle("on", b.dataset.value === prev)); fail(e, "Couldn't save"); }
+  };
+  async function loadBlocks() {
+    const box = $("#pv-blocks"); if (!box) return;
+    try {
+      const { users } = await api.get("/blocks");
+      box.innerHTML = users.length ? `<div class="list-card">${users.map((p) => `<div class="user-row">${avatar(p, "s")}<div class="grow"><b>${esc(p.display_name)}</b><div class="muted small">@${esc(p.username)}</div></div>
+        <button class="btn sm" data-action="unblock" data-user="${esc(p.username)}">Unblock</button></div>`).join("")}</div>`
+        : `<p class="muted small">You haven't blocked anyone.</p>`;
+    } catch (e) { box.innerHTML = `<p class="muted small">${esc(App.errText(e))}</p>`; }
+  }
+  App.actions["unblock"] = async (el) => {
+    await App.busy(el, async () => { await api.post("/users/block", { username: el.dataset.user, block: false }); toast("Unblocked @" + el.dataset.user); loadBlocks(); });
+  };
   const goYou = (scroll, tab) => { App.closeMenus(); if (tab) S.youTab = tab; S.scrollTo = scroll; if (S.route === "you") { if (tab) paintGrid(); const t = $(scroll === "hist" ? "#you-hist" : "#you-tabs"); S.scrollTo = null; if (t) t.scrollIntoView({ block: "start" }); } else location.hash = "#/you"; };
   App.actions["more-saved"] = () => goYou("tabs", "saved");
   App.actions["more-history"] = () => goYou("hist");
   App.actions["more-vault"] = () => { App.closeMenus(); App.openSecurity("vault"); };
 
+  // v8: Me page action row - Share profile (native share, clipboard fallback) and + add contact (starts a new chat).
+  App.actions["share-profile"] = async () => {
+    const u = S.user;
+    const url = location.origin + location.pathname;
+    const text = "@" + u.username + " on LokaChat";
+    const copy = async () => { try { await navigator.clipboard.writeText(url); toast("Profile link copied"); } catch (e) { toast("Couldn't copy the link", "err"); } };
+    try { if (navigator.share) await navigator.share({ title: "LokaChat", text, url }); else await copy(); }
+    catch (e) { if (!e || e.name !== "AbortError") await copy(); }
+  };
+  App.actions["add-contact"] = () => { App.closeMenus(); if (App.actions["new-chat"]) App.actions["new-chat"](); };
   App.actions["edit-profile"] = () => {
     const u = S.user;
     modal(`<h3>Edit profile</h3><form data-form="edit-profile">

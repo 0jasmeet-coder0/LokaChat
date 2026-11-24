@@ -81,30 +81,41 @@
     if (error) { setPending(false); throw error; }
   });
 
-  /** True when this page load is the redirect back from Google (we started it, and ?code / ?error is present). */
+  /** True when this page load is the redirect back from Google (we started it, and a ?code / #access_token / error is present). */
   App.oauthPending = () => {
     let t = 0;
     try { t = Number(localStorage.getItem(PENDING)) || 0; } catch (e) { /* ignore */ }
     if (!t) return false;
     if (Date.now() - t > 15 * 60 * 1000) { setPending(false); return false; }
     const q = new URLSearchParams(location.search);
-    return q.has("code") || q.has("error") || q.has("error_description");
+    const h = new URLSearchParams(location.hash.replace(/^#/, ""));
+    return q.has("code") || q.has("error") || q.has("error_description")
+        || h.has("access_token") || h.has("error") || h.has("error_description");
   };
 
-  /** Exchange ?code for a Supabase session, hand its access token to our API, return the API's answer
+  /** Finish the OAuth redirect: PKCE (?code) is exchanged for a session; the implicit flow (#access_token) is read
+   *  straight from the hash. Either way we hand the resulting Supabase access token to our API and return its answer
    *  ({token,user} | {step:"totp",mfa_token} | {step:"setup",...}). */
   App.oauthComplete = async () => {
-    const url = new URL(location.href), q = url.searchParams;
-    const code = q.get("code"), problem = q.get("error_description") || q.get("error");
+    const url = new URL(location.href), q = url.searchParams, h = new URLSearchParams(url.hash.replace(/^#/, ""));
+    const code = q.get("code");
+    const implicitToken = h.get("access_token");
+    const problem = q.get("error_description") || q.get("error") || h.get("error_description") || h.get("error");
     setPending(false);
-    ["code", "error", "error_code", "error_description"].forEach((k) => url.searchParams.delete(k));
-    try { history.replaceState(null, "", url.pathname + url.search + url.hash); } catch (e) { /* ignore */ }
-    if (problem || !code) throw new Error((problem || "Google sign-in was cancelled").replace(/\+/g, " "));
-    const c = oauth();
-    const { data, error } = await c.auth.exchangeCodeForSession(code);
-    if (error || !data || !data.session) throw new Error((error && error.message) || "Google sign-in failed");
-    const accessToken = data.session.access_token;
-    try { await c.auth.signOut({ scope: "local" }); } catch (e) { /* the token is only needed once */ }
+    // Strip the one-time OAuth params from BOTH the query and the hash before doing anything else.
+    ["code", "error", "error_code", "error_description", "state"].forEach((k) => q.delete(k));
+    const clean = url.pathname + url.search;   // the hash (tokens/errors) is always dropped
+    try { history.replaceState(null, "", clean); } catch (e) { /* ignore */ }
+
+    let accessToken = implicitToken;
+    if (!accessToken && code) {
+      const c = oauth();
+      const { data, error } = await c.auth.exchangeCodeForSession(code);
+      if (error || !data || !data.session) throw new Error((error && error.message) || "Google sign-in failed");
+      accessToken = data.session.access_token;
+      try { await c.auth.signOut({ scope: "local" }); } catch (e) { /* the token is only needed once */ }
+    }
+    if (!accessToken) throw new Error((problem || "Google sign-in was cancelled").replace(/\+/g, " "));
     return api.post("/auth/google", { access_token: accessToken }, { auth: false });
   };
 

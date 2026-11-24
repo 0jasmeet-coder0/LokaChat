@@ -167,7 +167,7 @@
   /** Music Library & Search. opts: { title, onPick(track with start/len), clip:true }. */
   App.musicLibrary = (opts) => {
     opts = opts || {};
-    let chip = "Trending", list = [], seq = 0, pv = null, pvI = -1, query = "";
+    let chip = "Trending", list = [], seq = 0, pv = null, pvI = -1, query = "", autoTried = false;
     const stop = () => { if (pv) { try { pv.pause(); } catch (e) { /* ignore */ } pv = null; } pvI = -1; };
     let m;
     const cover = (t) => (t.cover ? `<img src="${esc(t.cover)}" alt="" loading="lazy">` : icon("music"));
@@ -175,9 +175,11 @@
       const box = $(".lib-list", m.el); if (!box) return;
       box.innerHTML = list.length ? list.map((t, i) => `<div class="mlib-row ${pvI === i ? "playing" : ""}" data-i="${i}"><span class="cv">${cover(t)}<span class="eq"><i></i><i></i><i></i></span></span>
         <div class="grow"><b class="ellipsis" style="display:block">${esc(t.title)}</b><div class="muted small ellipsis">${esc(t.artist)}</div></div>
-        <button type="button" class="icon-btn" data-mb="play" aria-label="Preview">${icon(pvI === i ? "pause" : "play")}</button>
-        <button type="button" class="icon-btn heart ${isSaved(t.url) ? "on" : ""}" data-mb="heart" aria-label="Save audio">${icon("heart")}</button>
-        <button type="button" class="btn sm primary" data-mb="pick">Select</button></div>`).join("") : '<p class="muted small center" style="padding:18px 0">No songs found.</p>';
+        <div class="mlib-acts">
+          <button type="button" class="t-blue" data-mb="play">${pvI === i ? "Stop" : "Preview"}</button>
+          <button type="button" class="t-blue" data-mb="pick">Select</button>
+          <button type="button" class="${isSaved(t.url) ? "t-red" : "t-blue"}" data-mb="heart">${isSaved(t.url) ? "Remove" : "Save"}</button>
+        </div></div>`).join("") : '<p class="muted small center" style="padding:18px 0">No songs found.</p>';
     };
     const load = async () => {
       const my = ++seq, box = $(".lib-list", m.el); if (!box) return;
@@ -189,11 +191,12 @@
         else r = await trending(chip);
         if (my !== seq) return;
         list = r; stop(); paint();
+        if (!autoTried && list.length) { autoTried = true; const pb = $('[data-mb="play"]', box); if (pb) setTimeout(() => pb.click(), 220); }   // v8: auto-play the first track
       } catch (e) { if (my === seq) box.innerHTML = `<p class="muted small center" style="padding:18px 0">${esc(App.errText(e))}</p>`; }
     };
     const chips = () => Object.keys(TRENDING).concat(["Saved"]).map((c) => `<button type="button" data-chip="${esc(c)}" class="${c === chip && query.length < 2 ? "on" : ""}">${c === "Saved" ? "♥ Saved" : esc(c)}</button>`).join("");
     m = modal(`<h3>${esc(opts.title || "Music")}</h3><div id="lib-main"><div class="lib-top"><input class="lib-q" type="search" placeholder="Search songs or artists" autocomplete="off"></div>
-      <div class="lib-chips">${chips()}</div><div class="lib-list"></div></div><div id="lib-clip" hidden></div>`, { cls: "wide stack2", noFocus: true, onClose: () => { stop(); const c = $("#lib-clip", m.el); if (c && c._stop) c._stop(); } });
+      <div class="lib-chips">${chips()}</div><div class="lib-list"></div></div><div id="lib-clip" hidden></div>`, { cls: "wide stack2 note-win", noFocus: true, onClose: () => { stop(); const c = $("#lib-clip", m.el); if (c && c._stop) c._stop(); } });
     $(".lib-q", m.el).addEventListener("input", App.debounce((e) => { query = e.target.value.trim(); $(".lib-chips", m.el).innerHTML = chips(); load(); }, 350));
     $(".lib-chips", m.el).addEventListener("click", (e) => { const b = e.target.closest("[data-chip]"); if (!b) return; chip = b.dataset.chip; query = ""; $(".lib-q", m.el).value = ""; $(".lib-chips", m.el).innerHTML = chips(); load(); });
     $(".lib-list", m.el).addEventListener("click", (e) => {
@@ -587,8 +590,8 @@
       if (ex.f === "audios") { box.innerHTML = App.emptyBox("music", "Find music", "Search songs and artists to preview and save them."); return; }
       const posts = App.cacheGet("explore");
       if (!posts) { box.innerHTML = '<div class="spinner"></div>'; return; }
-      const list = filterPosts(posts);
-      box.innerHTML = list.length ? `<div class="explore">${list.map(exTile).join("")}</div>` : App.emptyBox("clips", "Nothing trending yet", "Reels and videos will show up here as people post them.");
+      const list = posts.filter((p) => p.type === "clip");   // v8: Search shows a Reels-only 9:16 grid
+      box.innerHTML = list.length ? `<div class="explore">${list.map(exTile).join("")}</div>` : App.emptyBox("clips", "No reels yet", "Reels will show up here as people post them.");
       return;
     }
     const parts = [];
@@ -641,6 +644,7 @@
   function swipe(dir) {              // dir +1 = swiped left (go forward), -1 = swiped right (go back)
     const route = S.route, sub = SUBS[route] && SUBS[route]();
     if (route === "messages" && $("#chat-wrap") && $("#chat-wrap").classList.contains("has-conv")) return;
+    if (route === "reels") { App.go(dir > 0 ? "/home" : "/search"); slide("#view", -dir); return; }   // v8: left -> Home, right -> Search
     if (sub) {
       const j = sub.keys.indexOf(sub.cur) + dir;
       if (j >= 0 && j < sub.keys.length) { sub.set(sub.keys[j]); slide(sub.anim, dir); return; }
@@ -653,7 +657,7 @@
   document.addEventListener("touchstart", (e) => {
     sw = null;
     if (!window.matchMedia("(max-width: 767px)").matches || e.touches.length !== 1 || !S.user) return;
-    if (e.target.closest(NO_SWIPE)) return;
+    if (e.target.closest(NO_SWIPE) && !(S.route === "reels" && e.target.closest(".reel-stage"))) return;
     const t = e.touches[0]; sw = { x: t.clientX, y: t.clientY, t: Date.now() };
   }, { passive: true });
   document.addEventListener("touchend", (e) => {

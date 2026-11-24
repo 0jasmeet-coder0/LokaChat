@@ -47,7 +47,7 @@
         <input type="hidden" name="gif_url" value="">
         <div class="row">${avatar(S.user, "s")}<input name="body" maxlength="500" placeholder="Add a comment..." autocomplete="off">
         <button class="gif-btn" type="button" data-action="c-gif" aria-label="Add a GIF or sticker">GIF</button>
-        <button class="btn primary sm" type="submit">Post</button></div>
+        <button class="btn primary sm cm-send" type="submit" aria-label="Send comment" title="Send">➤</button></div>
         <div class="cm-gifchip" hidden></div><div class="cm-pick-host"></div></form>
       <div class="cm-list"><div class="spinner"></div></div>`;
     if (App.cacheGet(ckey(id))) paintComments(id);
@@ -144,6 +144,12 @@
     box.innerHTML = `<div class="vplayer" tabindex="0" data-dbl="like-post" data-id="${esc(p.id)}">
       <video preload="metadata" playsinline ${p.poster_url ? `poster="${esc(p.poster_url)}"` : ""} src="${esc(p.media_url)}"></video>
       <div class="vp-center">${icon("play")}</div><div class="vp-cc"></div>
+      <div class="vp-top" data-nodbl><button class="vp-gear" type="button" data-p="gear" aria-label="Quality, speed and captions" title="Settings">${icon("gear")}</button></div>
+      <div class="vp-sheet" data-nodbl hidden>
+        <div class="vp-sec"><h4>Quality</h4><div class="vp-opts">${QUALITIES.map((q) => `<button type="button" data-p="q" data-q="${q}" class="${q === "Auto" ? "on" : ""}">${q}</button>`).join("")}</div></div>
+        <div class="vp-sec"><h4>Speed</h4><div class="vp-opts">${SPEEDS.map((s) => `<button type="button" data-p="speed" data-s="${s}" class="${s === 1 ? "on" : ""}">${s === 1 ? "Normal" : s + "x"}</button>`).join("")}</div></div>
+        <div class="vp-sec"><h4>Captions</h4><div class="vp-opts"><button type="button" data-p="cc">Auto-CC ${icon("check")}</button></div></div>
+        <button type="button" class="vp-close" data-p="sheet-close">Done</button></div>
       <div class="mini-ctl" data-p="mini-max"><button type="button" data-p="mini-play" aria-label="Play or pause">${icon("pause")}</button><button type="button" class="mini-x" data-p="mini-close" aria-label="Close miniplayer">${icon("close")}</button></div>
       <div class="vp-bar" data-nodbl>
         <input class="vp-seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Seek">
@@ -165,6 +171,18 @@
     const scaler = App.attachScaler(root, v, ({ q, effective }) => { const l = $("[data-m=quality]", root); if (l) l.textContent = q === "Auto" ? "Auto" + (effective ? " · " + effective + "p" : "") : q; });
     const cc = App.attachCC(root, v);
     const undock = () => { docked = false; root.classList.remove("mini"); box.style.minHeight = ""; };
+    // v8: swipe-down collapses the stage into the floating miniplayer, swipe-up goes fullscreen
+    const dockTo = (want) => {
+      if (!want) dismissed = false;
+      const on = want && !dismissed && (v.currentTime > 0 || !v.paused);
+      if (on === docked) return;
+      if (on) box.style.minHeight = box.getBoundingClientRect().height + "px";
+      docked = on; root.classList.toggle("mini", on);
+      root.classList.remove("dragging", "dragged");
+      root.style.left = root.style.top = root.style.right = root.style.bottom = "";
+      if (!on) box.style.minHeight = "";
+    };
+    const toggleFull = () => { document.fullscreenElement ? document.exitFullscreen() : (root.requestFullscreen ? root.requestFullscreen().catch(() => {}) : v.webkitEnterFullscreen && v.webkitEnterFullscreen()); };
     const fmt = (s) => App.dur(isFinite(s) ? s : 0);
     const setFill = (el, f) => el.style.setProperty("--p", (f * 100).toFixed(1) + "%");
     const paintPlay = () => {
@@ -211,6 +229,8 @@
       else if (k === "speed") { v.playbackRate = Number(b.dataset.s); $("[data-m=speed]", root).textContent = b.dataset.s === "1" ? "1x" : b.dataset.s + "x"; $$("[data-p=speed]", root).forEach((x) => x.classList.toggle("on", x === b)); $$(".vp-pop", root).forEach((x) => x.classList.remove("open")); }
       else if (k === "q") { scaler.set(b.dataset.q); $$("[data-p=q]", root).forEach((x) => x.classList.toggle("on", x === b)); $$(".vp-pop", root).forEach((x) => x.classList.remove("open")); }
       else if (k === "cc") { b.classList.toggle("on", cc.toggle()); }
+      else if (k === "gear") { const s = $(".vp-sheet", root); if (s) s.hidden = !s.hidden; }
+      else if (k === "sheet-close") { const s = $(".vp-sheet", root); if (s) s.hidden = true; }
       else if (k === "mini-play") toggle();
       else if (k === "mini-close") { dismissed = true; try { v.pause(); } catch (er) { /* ignore */ } undock(); }
       else if (k === "mini-max") { if (Date.now() - releasedFromDrag < 350) return; undock(); box.scrollIntoView({ behavior: "smooth", block: "center" }); }
@@ -219,8 +239,22 @@
         else if (v.requestPictureInPicture) v.requestPictureInPicture().catch(() => toast("Picture-in-picture isn't available here", "err"));
         else toast("Picture-in-picture isn't supported in this browser", "err");
       }
-      else if (k === "full") { document.fullscreenElement ? document.exitFullscreen() : (root.requestFullscreen ? root.requestFullscreen().catch(() => {}) : v.webkitEnterFullscreen && v.webkitEnterFullscreen()); }
+      else if (k === "full") { toggleFull(); }
     });
+    // v8: swipe on the stage - up = fullscreen, down = collapse into the floating miniplayer
+    let sdrag = null;
+    root.addEventListener("pointerdown", (e) => {
+      if (docked || e.pointerType === "mouse" || (e.button && e.button !== 0)) return;   // touch / pen only
+      if (e.target.closest("button, input, .vp-pop, .vp-sheet, .vp-bar, .vp-top, .mini-ctl")) return;
+      sdrag = { id: e.pointerId, x: e.clientX, y: e.clientY };
+    });
+    root.addEventListener("pointerup", (e) => {
+      if (!sdrag || e.pointerId !== sdrag.id) return;
+      const dy = e.clientY - sdrag.y, dx = e.clientX - sdrag.x; sdrag = null;
+      if (Math.abs(dy) < 60 || Math.abs(dy) <= Math.abs(dx) * 1.4) return;   // vertical swipe only
+      dy < 0 ? toggleFull() : dockTo(true);
+    });
+    root.addEventListener("pointercancel", () => { sdrag = null; });
     // ---- miniplayer: drag to any corner (pointer events cover mouse + touch), tap to maximize ----
     const ctl = $(".mini-ctl", root);
     let pdrag = null;
@@ -290,17 +324,7 @@
     return {
       el: root, video: v, toggle,
       /** Dock into the floating miniplayer when the stage scrolls out of view (only once playback has started). */
-      dock(want) {
-        if (!want) dismissed = false;
-        const on = want && !dismissed && (v.currentTime > 0 || !v.paused);
-        if (on === docked) return;
-        if (on) box.style.minHeight = box.getBoundingClientRect().height + "px";
-        docked = on; root.classList.toggle("mini", on);
-        // always re-anchor to the default corner (clears any inline drag position)
-        root.classList.remove("dragging", "dragged");
-        root.style.left = root.style.top = root.style.right = root.style.bottom = "";
-        if (!on) box.style.minHeight = "";
-      },
+      dock: dockTo,
       destroy() { scaler.destroy(); cc.destroy(); document.removeEventListener("keydown", key); clearTimeout(clickT); clearTimeout(idleT); clearInterval(adTick); if (adNode) { adNode.remove(); adNode = null; } try { v.pause(); } catch (e) { /* ignore */ } if (counted) send(false); v.removeAttribute("src"); v.load(); },
     };
   }
@@ -328,8 +352,8 @@
           <button class="chip-btn" data-action="share" data-id="${esc(p.id)}">${icon("share")}<span class="n">Share</span></button>${App.saveBtn(p)}
           ${vid && p.allow_download !== false ? `<button class="chip-btn" data-action="download-post" data-id="${esc(p.id)}">${icon("download")}<span class="n">Download</span></button>` : ""}
           ${p.author.id === S.user.id ? `<button class="chip-btn" data-action="delete-post" data-id="${esc(p.id)}">${icon("trash")}</button>` : ""}</div></div>
-      <div class="w-desc card"><b>${App.num(p.views)} views · ${App.timeAgo(p.created_at)}</b>${p.music ? `<div class="muted small">♪ ${esc(App.musicLabel(p.music))}</div>${(() => { const mt = App.parseMusic(p.music); return mt && mt.url ? App.audioChip(mt.url, { start: mt.start, len: mt.len, label: "clip" }) : ""; })()}` : ""}<p>${p.caption ? esc(p.caption) : '<span class="muted">No description.</span>'}</p></div>
-      <section class="w-comments" id="w-comments"></section></div>
+      <div class="w-desc w-card"><b>${App.num(p.views)} views · ${App.timeAgo(p.created_at)}</b>${p.music ? `<div class="muted small">♪ ${esc(App.musicLabel(p.music))}</div>${(() => { const mt = App.parseMusic(p.music); return mt && mt.url ? App.audioChip(mt.url, { start: mt.start, len: mt.len, label: "clip" }) : ""; })()}` : ""}<p>${p.caption ? esc(p.caption) : '<span class="muted">No description.</span>'}</p></div>
+      <section class="w-comments w-card" id="w-comments"></section></div>
       <aside class="w-next"><h3>Up next</h3>${upNext(p)}</aside></div>`;
     const stage = $("#w-stage", pane);
     if (stageIO) { stageIO.disconnect(); stageIO = null; }

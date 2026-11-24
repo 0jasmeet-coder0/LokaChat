@@ -1,14 +1,14 @@
 /* =====================================================================
-   LokaChat - chat.js   (v4)  Instagram-style Messages
+   LokaChat - chat.js   (v8)  Instagram-style Messages
    - Header @username, search, Notes + Stories row, Chats / Stories / Channels
-   - End-to-end encrypted messages: text, GIF/stickers, image/video/audio/voice
-     attachments (encrypted in the browser, stored as opaque blobs), replies,
-     heart reactions (double-tap), optimistic sending with retry
-   - The floating bottom-right Messages pill + quick-chat popover (desktop)
-   Encryption is invisible (WhatsApp style) and purely symmetric: every message (both directions, every device) is AES-256-GCM
-   with a key derived by PBKDF2/SHA-256 from the conversation id + app salt (crypto.js conversationKey). No per-device key pairs.
-   Messages sent by older builds may carry an "f." iv prefix (same key) - it is stripped when reading.
-   Decrypted message text is JSON: {v:1,k:"text|gif|image|video|audio|voice|music",...}
+   - TRUE end-to-end encryption for private chats (direct + group): every device owns an ECDH P-256
+     identity key; each conversation has a random AES-256-GCM key per epoch, wrapped for every member
+     device (ephemeral ECDH -> HKDF-SHA256 -> AES-256-GCM). The first device to open a chat creates
+     epoch 1; adding/removing a member or device rotates to a new epoch. Channels stay plaintext.
+     Pre-v8 messages keep decrypting with the legacy server-derivable key (crypto.js conversationKey).
+   - Attachments (image/video/audio/voice) are encrypted in the browser and stored as opaque blobs.
+   - Optimistic sending with retry (incl. automatic key rotation retry on 409), replies, heart reactions.
+   - Locked 100dvh full-screen mobile chat (fixed header + composer, only the message list scrolls).
    ===================================================================== */
 (function () {
   "use strict";
@@ -16,13 +16,16 @@
   const api = window.LokaApi, C = window.LokaCrypto;
   const MAX_ATT = 25 * 1024 * 1024;
 
-  const keyCache = new Map();   // conversation id -> CryptoKey
+  const convKeys = new Map();   // `${chatId}:${epoch}` -> CryptoKey
+  const stateCache = new Map(); // chatId -> { at, epoch, needsRotation, wraps, members, role }
   const msgStore = new Map();   // conversation id -> [message]
   const previews = new Map();   // conversation id -> preview text
   const attCache = new Map();   // storage path -> blob URL (decrypted attachment)
   let openId = null;            // conversation currently shown in #conv
   let replyTo = null;           // { id, n, p }
   let chatQuery = "";
+  let device = null;            // this device's ECDH identity (private key never leaves the browser)
+  let deviceReady = null;       // in-flight device-registration promise
 
   /** v7: mobile full-screen chat - the bottom nav + top bar step aside (body.in-chat). */
   const setInChat = (on) => document.body.classList.toggle("in-chat", !!on);
@@ -47,15 +50,108 @@
   };
   const previewOf = (pl) => ({ share: "\u{1F517} Shared a post", text: pl.t, music: "🎵 " + (pl.t || "Music"), gif: "GIF", sticker: "Sticker", image: "📷 Photo", video: "🎥 Video", audio: "🎵 Music clip", voice: "🎤 Voice message" }[pl.k] || pl.t || "");
 
-  // ---------- keys + decoding ----------
-  /** The one message key for a conversation (same on every device). */
-  const convKey = (chat) => C.conversationKey(chat.id);
+  // ---------- v8 E2EE: per-device ECDH P-256 identity + AES-256-GCM key epochs ----------
   const ivOf = (iv) => (typeof iv === "string" && iv.charAt(0) === "f" && iv.charAt(1) === "." ? iv.slice(2) : iv);   // legacy "f." marker
+
+  /** Register this device's public key once per session (retried once); resolves to the device object. */
+  function ensureDevice() {
+    if (device && device.registered) return Promise.resolve(device);
+    if (deviceReady) return deviceReady;
+    deviceReady = (async () => {
+      const d = await C.ensureDevice();
+      device = { ...d, registered: false };
+      const post = () => api.post("/e2ee/devices", { device_id: d.id, public_key: C.publicJwk(d), label: (navigator.platform || "web").slice(0, 60) });
+      try { await post(); device.registered = true; }
+      catch (e) {
+        try { await new Promise((r) => setTimeout(r, 800)); await post(); device.registered = true; }
+        catch (e2) { deviceReady = null; }   // allow a later retry
+      }
+      return device;
+    })();
+    return deviceReady;
+  }
+  App.ensureDevice = ensureDevice;
+
+  /** Fresh (cached ~20 s) key state for a conversation: current epoch, my wraps, member devices. */
+  async function keyState(chat, force) {
+    const hit = stateCache.get(chat.id);
+    if (!force && hit && Date.now() - hit.at < 20000) return hit;
+    const b = await api.get(`/e2ee/chats/${chat.id}/keys`);
+    const st = { at: Date.now(), epoch: b.key_epoch || 0, needsRotation: !!b.needs_rotation,
+                 wraps: b.my_wraps || [], members: b.members || [], role: b.my_role };
+    stateCache.set(chat.id, st);
+    return st;
+  }
+
+  /** Unwrap the conversation key for one epoch (this device's wrap). null when this device isn't wrapped. */
+  async function unwrapEpoch(chat, epoch) {
+    const ck = chat.id + ":" + epoch;
+    if (convKeys.has(ck)) return convKeys.get(ck);
+    if (!device) await ensureDevice();
+    const st = await keyState(chat);
+    const w = st.wraps.find((x) => x.epoch === epoch && x.device_id === device.id);
+    if (!w) return null;
+    try {
+      const key = await C.importRawKey(await C.unwrapKey(device.privateKey, w.eph_pub, w.wrapped));
+      convKeys.set(ck, key);
+      return key;
+    } catch (e) { return null; }
+  }
+  const currentEpoch = (chat) => (stateCache.get(chat.id) || {}).epoch || chat.key_epoch || 0;
+
+  /** Rotate the chat to a fresh epoch, wrapping the new key for every member device. Returns the new key. */
+  async function rotateChat(chat) {
+    const st = await keyState(chat, true);
+    const raw = C.generateConversationKey();
+    const wraps = [];
+    for (const m of st.members) for (const dev of (m.devices || [])) {
+      const w = await C.wrapKey(dev.public_key, raw);
+      wraps.push({ user_id: m.id, device_id: dev.device_id, eph_pub: w.eph_pub, wrapped: w.wrapped });
+    }
+    let mine = wraps.find((w) => w.device_id === device.id);
+    if (!mine) {                                            // this device must always be included
+      const w = await C.wrapKey(C.publicJwk(device), raw);
+      mine = { user_id: S.user.id, device_id: device.id, eph_pub: w.eph_pub, wrapped: w.wrapped };
+      wraps.push(mine);
+    }
+    const res = await api.post(`/e2ee/chats/${chat.id}/rotate`, { epoch: st.epoch + 1, wraps });
+    const key = await C.importRawKey(raw);
+    convKeys.set(chat.id + ":" + res.key_epoch, key);
+    stateCache.set(chat.id, { at: Date.now(), epoch: res.key_epoch, needsRotation: false,
+                              wraps: [{ epoch: res.key_epoch, device_id: device.id, eph_pub: mine.eph_pub, wrapped: mine.wrapped }],
+                              members: st.members, role: st.role });
+    chat.key_epoch = res.key_epoch; chat.needs_rotation = false;
+    return key;
+  }
+
+  /** The CURRENT key for a chat, upgrading/rotating when needed. Channels return null (plaintext). */
+  async function ensureChatKey(chat, force) {
+    if (chat.type === "channel") return null;
+    await ensureDevice();
+    const st = await keyState(chat, force);
+    const wrapped = st.epoch >= 1 && st.wraps.some((w) => w.epoch === st.epoch && w.device_id === device.id);
+    if (st.epoch === 0 || st.needsRotation || !wrapped) return rotateChat(chat);
+    return unwrapEpoch(chat, st.epoch);
+  }
+  App.ensureChatKey = ensureChatKey;
+  App.e2ee = {
+    ensureDevice, ensureChatKey, keyState,
+    deviceId: () => (device ? device.id : null),
+    reset: () => { stateCache.clear(); convKeys.clear(); },
+    dropChat: (id) => { stateCache.delete(id); for (const k of [...convKeys.keys()]) if (k.startsWith(id + ":")) convKeys.delete(k); },
+  };
+
+  /** The key for a specific message epoch: legacy epoch 0 derives from the chat id, newer epochs unwrap. */
+  async function keyForEpoch(chat, epoch) { return (epoch || 0) === 0 ? C.conversationKey(chat.id) : unwrapEpoch(chat, epoch); }
+
+  /** Decode one message: legacy (epoch 0) with the derived key, otherwise this epoch's wrapped key. */
   async function decode(chat, m) {
-    const base = { ...m, failed: false, reactions: m.reactions || [] };
+    const base = { ...m, failed: false, reactions: m.reactions || [], key_epoch: m.key_epoch || 0 };
     if (!m.encrypted) return { ...base, payload: { k: "text", t: m.ciphertext } };
     try {
-      return { ...base, payload: parsePayload(await C.decryptText(await convKey(chat), m.ciphertext, ivOf(m.iv))) };
+      const key = await keyForEpoch(chat, m.key_epoch);
+      if (!key) return { ...base, payload: { k: "text", t: "" }, failed: true, locked: true };
+      return { ...base, payload: parsePayload(await C.decryptText(key, m.ciphertext, ivOf(m.iv))) };
     } catch (e) { return { ...base, payload: { k: "text", t: "" }, failed: true }; }
   }
   const previewMsg = (chat, m) => (m.sender_id === S.user.id ? "You: " : "") + (m.failed ? "Message from earlier session" : previewOf(m.payload));
@@ -399,7 +495,8 @@
     const mine = m.sender_id === S.user.id, pl = m.payload;
     const who = !mine && chat.type !== "direct" ? chat.members.find((x) => x.id === m.sender_id) : null;
     let body;
-    if (m.failed) body = `<span class="undec">Message from earlier session</span>`;
+    if (m.locked) body = `<span class="undec">${icon("lock")} Locked · this device has no key for this message</span>`;
+    else if (m.failed) body = `<span class="undec">Message from an earlier session</span>`;
     else if (pl.k === "music") body = musicCard(pl);
     else if (pl.k === "share") { const reel = pl.fmt === "reel" || pl.ty === "clip"; body = `<div class="m-share" data-action="open-shared" data-pid="${esc(pl.pid || "")}" data-fmt="${esc(pl.fmt || "")}" data-ty="${esc(pl.ty || "")}">${pl.th && /^https:\/\//.test(pl.th) ? `<img class="att-img" src="${esc(pl.th)}" alt="" loading="lazy">` : ""}<b>${esc(pl.t || "Shared post")}</b><span class="muted small">${icon(reel ? "clips" : "play")} Open in ${reel ? "Reels" : "Theater"} player</span></div>`; }
     else if (pl.k === "gif") body = pl.u ? `<img class="gif" src="${esc(pl.u)}" alt="${esc(pl.t || "GIF")}" loading="lazy">` : `<span class="sticker">${esc(pl.t)}</span>`;
@@ -423,7 +520,7 @@
           const m = (msgStore.get(chat.id) || []).find((x) => x.payload && x.payload.p === path);
           const res = await fetch(api.publicUrl(path));
           if (!res.ok) throw new Error("Attachment unavailable (" + res.status + ")");
-          const plain = await C.decryptBytes(await convKey(chat), await res.arrayBuffer());
+          const plain = await C.decryptBytes(await keyForEpoch(chat, m && m.key_epoch), await res.arrayBuffer());
           url = URL.createObjectURL(new Blob([plain], { type: (m && m.payload.m) || "application/octet-stream" }));
           attCache.set(path, url);
         }
@@ -466,30 +563,34 @@
     await transmit(chat, tmp);
     return tmp;
   }
-  async function transmit(chat, tmp) {
+  async function transmit(chat, tmp, attempt) {
     tmp.pending = true; tmp.failedSend = false; repaintMsg(chat, tmp);
     try {
       let body;
       if (chat.type === "channel") body = { conversation_id: chat.id, ciphertext: tmp.payload.t, iv: "" };
       else {
-        const key = await convKey(chat);
-        if (tmp.payload._file) {                                // attachment: encrypt + upload first
-          const f = tmp.payload._file;
-          const bytes = await C.encryptBytes(key, await f.arrayBuffer());
+        const key = await ensureChatKey(chat, attempt > 0);
+        if (!key) throw new Error("Encryption key unavailable");
+        const payload = { ...tmp.payload };                     // keep tmp.payload pristine until the send succeeds
+        if (payload._file) {                                    // attachment: encrypt + upload first
+          const bytes = await C.encryptBytes(key, await payload._file.arrayBuffer());
           const path = `${S.user.id}/chat/${uid()}.bin`;
           await api.upload(path, new Blob([bytes], { type: "application/octet-stream" }), "application/octet-stream");
-          tmp.payload = { ...tmp.payload, p: path }; delete tmp.payload._file;
+          payload.p = path; delete payload._file;
           attCache.set(path, tmp.localUrl);
         }
-        const sealed = await C.encryptText(key, JSON.stringify({ v: 1, ...tmp.payload }));
-        body = { conversation_id: chat.id, ciphertext: sealed.ciphertext, iv: sealed.iv };
+        const sealed = await C.encryptText(key, JSON.stringify({ v: 1, ...payload }));
+        body = { conversation_id: chat.id, ciphertext: sealed.ciphertext, iv: sealed.iv, key_epoch: currentEpoch(chat) };
+        tmp.__payload = payload;
       }
       const sent = await api.post("/chats/send", body);
+      if (tmp.__payload) { tmp.payload = tmp.__payload; delete tmp.__payload; }
       const oldId = tmp.id;
-      Object.assign(tmp, { id: sent.id, created_at: sent.created_at, pending: false, failedSend: false, __oldId: oldId });
+      Object.assign(tmp, { id: sent.id, created_at: sent.created_at, pending: false, failedSend: false, failed: false, locked: false, __oldId: oldId });
       repaintMsg(chat, tmp); delete tmp.__oldId;
       chat.last_message = sent; chat.last_message_at = sent.created_at;
     } catch (e) {
+      if (e && e.status === 409 && !attempt) { App.e2ee.reset(); return transmit(chat, tmp, 1); }   // key rotated elsewhere -> refresh + retry once
       tmp.pending = false; tmp.failedSend = true; repaintMsg(chat, tmp);
       fail(e, "Couldn't send");
     }
@@ -653,7 +754,7 @@
     try {
       let body;
       if (chat.type === "channel") body = { message_id: mid, ciphertext: text, iv: "" };
-      else { const sealed = await C.encryptText(await convKey(chat), JSON.stringify({ v: 1, ...m.payload })); body = { message_id: mid, ciphertext: sealed.ciphertext, iv: sealed.iv }; }
+      else { const sealed = await C.encryptText(await keyForEpoch(chat, m.key_epoch), JSON.stringify({ v: 1, ...m.payload })); body = { message_id: mid, ciphertext: sealed.ciphertext, iv: sealed.iv }; }
       await api.post("/chats/edit", body); App.cacheDrop("msgs:" + chat.id);
       previews.set(chat.id, previewMsg(chat, (msgStore.get(chat.id) || []).slice(-1)[0] || m)); paintList();
     } catch (e) { m.payload = old; m.edited_at = oldAt; repaintMsg(chat, m); fail(e, "Couldn't edit"); }
@@ -896,7 +997,7 @@
     if (!chat || !(await App.confirm("Leave this conversation?", chat.type === "channel" ? "You will stop receiving broadcasts." : "You will lose access to its messages.", "Leave", true))) return;
     await App.busy(el, async () => {
       await api.del("/chats/" + chat.id);
-      S.chats = S.chats.filter((c) => c.id !== chat.id); App.cacheDrop("chats"); msgStore.delete(chat.id); keyCache.delete(chat.id);
+      S.chats = S.chats.filter((c) => c.id !== chat.id); App.cacheDrop("chats"); msgStore.delete(chat.id); App.e2ee.dropChat(chat.id);
       App.closeDrawers(); toast("Left conversation"); App.go("/messages");
     });
   };
@@ -926,8 +1027,9 @@
     const byName = Object.fromEntries(users.map((u) => [u.username, u]));
     const missing = names.filter((n) => !byName[n]);
     if (missing.length) throw new Error("User not found: " + missing.join(", "));
-    // no per-device keys any more: the server just stores a placeholder, messages use the conversation key
-    return api.post("/chats/create", { type, title, description, members: names.map((n) => ({ username: n, wrapped_key: "fb1" })), my_wrapped_key: "fb1" });
+    // v8: keys aren't exchanged at creation. The first device to open the chat creates epoch 1 and wraps it
+    // for every member device; the placeholder below is ignored by the server (which defaults to "e2ee").
+    return api.post("/chats/create", { type, title, description, members: names.map((n) => ({ username: n, wrapped_key: "e2ee" })), my_wrapped_key: "e2ee" });
   }
 
   // ---------- v7: dedicated "New group chat" composer ----------
@@ -983,7 +1085,7 @@
   document.addEventListener("click", (e) => { const pop = $("#pill-pop"); if (pop && pop.classList.contains("open") && !e.target.closest("#msg-pill-wrap")) pop.classList.remove("open"); }, true);
 
   /** Called on logout: forget keys and cached plaintext. */
-  App.resetChat = () => { setInChat(false); suggLoaded = false; keyCache.clear(); msgStore.clear(); previews.clear(); attCache.forEach((u) => URL.revokeObjectURL(u)); attCache.clear(); openId = null; replyTo = null; chatQuery = ""; const p = $("#view [data-pane=messages]"); if (p) p.remove(); };
+  App.resetChat = () => { setInChat(false); suggLoaded = false; App.e2ee.reset(); msgStore.clear(); previews.clear(); attCache.forEach((u) => URL.revokeObjectURL(u)); attCache.clear(); openId = null; replyTo = null; chatQuery = ""; const p = $("#view [data-pane=messages]"); if (p) p.remove(); };
   /** After restoring keys, forget undecryptable results and re-render. */
-  App.refreshChats = async () => { keyCache.clear(); msgStore.clear(); App.cacheDrop("chats", "msgs:"); await loadChats(true); const c = find(openId); if (c && S.route === "messages") openConv(c, {}); };
+  App.refreshChats = async () => { App.e2ee.reset(); msgStore.clear(); App.cacheDrop("chats", "msgs:"); await loadChats(true); const c = find(openId); if (c && S.route === "messages") openConv(c, {}); };
 })();

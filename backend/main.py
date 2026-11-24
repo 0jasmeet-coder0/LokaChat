@@ -104,6 +104,10 @@ def me_shape(u: dict) -> dict:
         "key_backup": u.get("key_backup"),  # password-encrypted E2EE key (opaque to the server)
         "totp_enabled": bool(u.get("totp_enabled")),
         "auth_provider": u.get("auth_provider") or "password",
+        # v8: privacy / safety controls
+        "account_privacy": u.get("account_privacy") or "public",
+        "who_can_message": u.get("who_can_message") or "everyone",
+        "who_can_comment": u.get("who_can_comment") or "everyone",
         "followers": count(rows(table("follows").select("follower_id").eq("following_id", uid))),
         "following": count(rows(table("follows").select("following_id").eq("follower_id", uid))),
         "posts": count(rows(table("posts").select("id").eq("author_id", uid))),
@@ -147,11 +151,19 @@ def session_for(user: dict) -> dict:
 def send_otp_to(user: dict, purpose: str, bg: BackgroundTasks) -> dict:
     code = auth.issue_otp(user["id"], purpose)
     contact = user.get("email") or user.get("phone")
-    if os.environ.get("VERCEL"):
+    if not settings.OTP_DEV_MODE:
+        # v8: production - deliver synchronously and surface the real SMTP/SMS problem instead of silently
+        # telling the user a code was sent (OtpDeliveryError carries a safe, human-readable reason).
+        try:
+            auth.deliver_otp(contact, code, purpose)
+        except auth.OtpDeliveryError as e:
+            log.error("OTP delivery failed for %s: %s", auth.mask_contact(contact), e)
+            raise HTTPException(502, str(e))
+    elif os.environ.get("VERCEL"):
         # Serverless: work after the response may be frozen, so deliver before responding.
         try:
             auth.deliver_otp(contact, code, purpose)
-        except Exception:  # never fail sign-in flow on a mail hiccup; user can resend
+        except Exception:  # dev mode: the code is also returned as dev_otp, so a mail hiccup never blocks sign-in
             log.exception("OTP delivery failed")
     else:
         bg.add_task(auth.deliver_otp, contact, code, purpose)
@@ -164,6 +176,44 @@ def send_otp_to(user: dict, purpose: str, bg: BackgroundTasks) -> dict:
 
 def following_ids(uid: str) -> list:
     return [r["following_id"] for r in rows(table("follows").select("following_id").eq("follower_id", uid))]
+
+
+# ---------------------------------------------------------------- v8: blocks, private accounts, message policy
+def blocked_pairs(uid: str) -> set:
+    """Ids of users the caller blocked + users who blocked the caller (a block hides both sides from each other)."""
+    mine = rows(table("blocks").select("blocked_id").eq("blocker_id", uid))
+    theirs = rows(table("blocks").select("blocker_id").eq("blocked_id", uid))
+    return {r["blocked_id"] for r in mine} | {r["blocker_id"] for r in theirs}
+
+
+def private_ids(author_ids) -> set:
+    ids = list(set(author_ids))
+    if not ids:
+        return set()
+    return {u["id"] for u in rows(table("users").select("id").in_("id", ids).eq("account_privacy", "private"))}
+
+
+def filter_visible(posts: list, user: dict, followed=None) -> list:
+    """Server-side privacy gate: drops posts by blocked users and by PRIVATE accounts the viewer doesn't follow."""
+    uid = user["id"]
+    others = [p for p in posts if p["author_id"] != uid]
+    if not others:
+        return list(posts)
+    fset = set(following_ids(uid) if followed is None else followed)
+    blocked = blocked_pairs(uid)
+    priv = private_ids([p["author_id"] for p in others])
+    return [p for p in posts if p["author_id"] == uid
+            or (p["author_id"] not in blocked and (p["author_id"] not in priv or p["author_id"] in fset))]
+
+
+def dm_denied(sender: dict, target: dict) -> Optional[str]:
+    """Why `sender` may not START a chat with `target` (their 'who can message me' setting), or None."""
+    policy = target.get("who_can_message") or "everyone"
+    if policy == "nobody":
+        return f"@{target['username']} isn't accepting new messages"
+    if policy == "followers" and not first(table("follows").select("follower_id").eq("follower_id", sender["id"]).eq("following_id", target["id"])):
+        return f"Only followers of @{target['username']} can message them. Follow them first."
+    return None
 
 
 def valid_path(path: Optional[str], user: dict) -> Optional[str]:
@@ -458,6 +508,11 @@ def update_me(body: ProfileUpdate, user: dict = Depends(current_user)):
         changes["avatar_path"] = valid_path(changes["avatar_path"], user)
     if changes:
         table("users").update(changes).eq("id", user["id"]).execute()
+        if changes.get("account_privacy") == "public" and user.get("account_privacy") == "private":
+            # going public approves everyone who was waiting for a follow-request answer
+            for req in rows(table("follow_requests").select("*").eq("target_id", user["id"])):
+                table("follows").upsert({"follower_id": req["requester_id"], "following_id": user["id"]}, on_conflict="follower_id,following_id").execute()
+            table("follow_requests").delete().eq("target_id", user["id"]).execute()
         user = {**user, **changes}
     return me_shape(user)
 
@@ -490,7 +545,9 @@ def search_users(q: str = Query("", max_length=40), user: dict = Depends(current
             if u["is_verified"]:
                 found[u["id"]] = u
     followed = set(following_ids(user["id"]))
-    return {"users": [{**pub(u), "is_following": u["id"] in followed, "is_me": u["id"] == user["id"]} for u in found.values()][:15]}
+    hidden = blocked_pairs(user["id"])     # v8: blocked users never show up in search
+    return {"users": [{**pub(u), "is_following": u["id"] in followed, "is_me": u["id"] == user["id"], "is_private": u.get("account_privacy") == "private"}
+                      for u in found.values() if u["id"] not in hidden][:15]}
 
 
 @app.get("/users/following")
@@ -538,12 +595,20 @@ def user_profile(username: str, user: dict = Depends(current_user)):
     target = get_user_by_name(username)
     if not target or not target["is_verified"]:
         raise HTTPException(404, "User not found")
-    tid = target["id"]
+    tid, uid = target["id"], user["id"]
+    i_blocked = tid != uid and first(table("blocks").select("*").eq("blocker_id", uid).eq("blocked_id", tid)) is not None
+    if tid != uid and not i_blocked and tid in blocked_pairs(uid):
+        raise HTTPException(404, "User not found")         # they blocked me: the profile does not exist for me
+    is_following = first(table("follows").select("*").eq("follower_id", uid).eq("following_id", tid)) is not None
+    private = target.get("account_privacy") == "private"
+    locked = tid != uid and (i_blocked or (private and not is_following))
+    requested = bool(locked and not i_blocked and first(table("follow_requests").select("*").eq("requester_id", uid).eq("target_id", tid)))
     return {**pub(target),
             "followers": count(rows(table("follows").select("follower_id").eq("following_id", tid))),
             "following": count(rows(table("follows").select("following_id").eq("follower_id", tid))),
-            "is_following": first(table("follows").select("*").eq("follower_id", user["id"]).eq("following_id", tid)) is not None,
-            "is_me": tid == user["id"]}
+            "is_following": is_following, "is_me": tid == uid,
+            "is_private": private, "locked": bool(locked), "follow_requested": requested, "is_blocked": bool(i_blocked),
+            "can_message": tid != uid and not i_blocked and dm_denied(user, target) is None}
 
 
 @app.post("/users/follow")
@@ -553,11 +618,21 @@ def follow(body: FollowIn, user: dict = Depends(current_user)):
         raise HTTPException(404, "User not found")
     if target["id"] == user["id"]:
         raise HTTPException(400, "You cannot follow yourself")
+    if target["id"] in blocked_pairs(user["id"]):
+        raise HTTPException(403, "You can't follow this account")
+    requested = False
     if body.follow:
-        table("follows").upsert({"follower_id": user["id"], "following_id": target["id"]}, on_conflict="follower_id,following_id").execute()
+        already = first(table("follows").select("*").eq("follower_id", user["id"]).eq("following_id", target["id"]))
+        if target.get("account_privacy") == "private" and not already:
+            # private account: send a follow request instead; the owner approves it (POST /users/follow-requests/respond)
+            table("follow_requests").upsert({"requester_id": user["id"], "target_id": target["id"]}, on_conflict="requester_id,target_id").execute()
+            requested = True
+        else:
+            table("follows").upsert({"follower_id": user["id"], "following_id": target["id"]}, on_conflict="follower_id,following_id").execute()
     else:
         table("follows").delete().eq("follower_id", user["id"]).eq("following_id", target["id"]).execute()
-    return {"following": body.follow,
+        table("follow_requests").delete().eq("requester_id", user["id"]).eq("target_id", target["id"]).execute()
+    return {"following": body.follow and not requested, "requested": requested,
             "followers": count(rows(table("follows").select("follower_id").eq("following_id", target["id"])))}
 
 
@@ -570,12 +645,18 @@ def is_live(post: dict) -> bool:
     return not post.get("expires_at") or parse_ts(post["expires_at"]) > now()
 
 
-def can_view(post: dict, user: dict, followed: set) -> bool:
+def basic_view(post: dict, user: dict, followed: set) -> bool:
+    """Visibility rules that need no extra queries (own post, live, public/followers). Lists then pass through filter_visible."""
     if post["author_id"] == user["id"]:
         return True
     if not is_live(post):
         return False
     return post["visibility"] == "public" or post["author_id"] in followed
+
+
+def can_view(post: dict, user: dict, followed: set) -> bool:
+    """Single-post check: basic rules + v8 block / private-account gate."""
+    return basic_view(post, user, followed) and bool(filter_visible([post], user, followed))
 
 
 def shape_posts(posts: list, user: dict) -> list:
@@ -710,17 +791,17 @@ def feed(tab: Literal["recommended", "following", "clips", "stories", "mine", "u
         # then weave Sponsored posts in (Home grid: every 6 posts, Reels: every 5 reels).
         kinds = {"recommended": ["video", "photo"], "clips": ["clip"], "explore": ["video", "clip", "photo"]}[tab]
         window = rows(base().eq("visibility", "public").eq("is_sponsored", False).in_("type", kinds).order("created_at", desc=True).limit(max(limit * 3, 90)))
-        organic = rank_posts(window)[:limit]
+        organic = rank_posts(filter_visible(window, user, set(followed)))[:limit]
         if tab == "explore":
             return {"posts": shape_posts(organic, user)}
-        ads = sponsored_pool(["video", "photo", "clip"] if tab == "recommended" else ["clip"], {p["id"] for p in organic})
+        ads = filter_visible(sponsored_pool(["video", "photo", "clip"] if tab == "recommended" else ["clip"], {p["id"] for p in organic}), user, set(followed))
         if q.strip():
             ads = []                                   # searches show only real matches
         return {"posts": shape_posts(inject_ads(organic, ads, 6 if tab == "recommended" else 5), user)}
     elif tab in ("liked", "liked_reels"):
         lids = [r["post_id"] for r in rows(table("post_likes").select("post_id").eq("user_id", uid).order("created_at", desc=True).limit(150))]
         kinds = ["clip"] if tab == "liked_reels" else ["video", "photo"]
-        found = [p for p in rows(table("posts").select("*").in_("id", lids).in_("type", kinds)) if can_view(p, user, set(followed))] if lids else []
+        found = filter_visible([p for p in rows(table("posts").select("*").in_("id", lids).in_("type", kinds)) if basic_view(p, user, set(followed))], user, set(followed)) if lids else []
         order = {pid: i for i, pid in enumerate(lids)}
         found.sort(key=lambda p: order.get(p["id"], 1e9))      # most recently liked first
         return {"posts": shape_posts(found[:limit], user)}
@@ -733,17 +814,18 @@ def feed(tab: Literal["recommended", "following", "clips", "stories", "mine", "u
         found += rows(base().eq("type", "community").eq("visibility", "followers").in_("author_id", followed + [uid]).order("created_at", desc=True).limit(limit))
     elif tab == "saved":
         sids = [r["post_id"] for r in rows(table("saved_posts").select("post_id").eq("user_id", uid).order("created_at", desc=True).limit(100))]
-        found = [p for p in rows(base().in_("id", sids)) if can_view(p, user, set(followed))] if sids else []
+        found = [p for p in rows(base().in_("id", sids)) if basic_view(p, user, set(followed))] if sids else []
     elif tab == "stories":
         found = rows(base().in_("author_id", followed + [uid]).eq("type", "story").gt("expires_at", iso(now())).order("created_at", desc=True).limit(100))
     elif tab == "mine":
         found = [p for p in rows(base().eq("author_id", uid).order("created_at", desc=True).limit(limit)) if is_live(p)]
     elif tab == "user":
         target = get_user_by_name(username)
-        if not target:
+        if not target or (target["id"] != uid and target["id"] in blocked_pairs(uid)):
             raise HTTPException(404, "User not found")
         found = [p for p in rows(base().eq("author_id", target["id"]).neq("type", "story").order("created_at", desc=True).limit(limit))
-                 if can_view(p, user, set(followed))]
+                 if basic_view(p, user, set(followed))]
+    found = filter_visible(found, user, set(followed))      # v8: blocks + private accounts, enforced on the server
     found.sort(key=lambda p: p["created_at"], reverse=True)
     return {"posts": shape_posts(found[:limit], user)}
 
@@ -790,7 +872,7 @@ def history(user: dict = Depends(current_user)):
         return {"items": []}
     followed = set(following_ids(user["id"]))
     posts = {p["id"]: p for p in rows(table("posts").select("*").in_("id", [x["post_id"] for x in h]))}
-    visible = [posts[x["post_id"]] for x in h if x["post_id"] in posts and can_view(posts[x["post_id"]], user, followed)]
+    visible = filter_visible([posts[x["post_id"]] for x in h if x["post_id"] in posts and basic_view(posts[x["post_id"]], user, followed)], user, followed)
     shaped = {p["id"]: p for p in shape_posts(visible, user)}
     return {"items": [{"post": shaped[x["post_id"]], "position": x["position"], "duration": x["duration"], "watched_at": x["watched_at"]}
                       for x in h if x["post_id"] in shaped]}
@@ -810,7 +892,7 @@ def delete_post(post_id: str, user: dict = Depends(current_user)):
 def shape_message(m: dict) -> dict:
     return {"id": m["id"], "conversation_id": m["conversation_id"], "sender_id": m["sender_id"],
             "ciphertext": m["ciphertext"], "iv": m.get("iv") or "", "encrypted": bool(m.get("encrypted", True)),
-            "created_at": m["created_at"], "edited_at": m.get("edited_at")}
+            "created_at": m["created_at"], "edited_at": m.get("edited_at"), "key_epoch": m.get("key_epoch") or 0}
 
 
 def membership(conv_id: str, user: dict) -> dict:
@@ -841,7 +923,8 @@ def list_chats(user: dict = Depends(current_user)):
         out.append({
             "id": c["id"], "type": c["type"], "title": c.get("title") or "", "description": c.get("description") or "",
             "created_at": c["created_at"], "last_message_at": c.get("last_message_at") or c["created_at"],
-            "pinned_message_id": c.get("pinned_message_id"), "my_role": m["role"], "wrapped_key": m.get("wrapped_key"),
+            "pinned_message_id": c.get("pinned_message_id"), "key_epoch": c.get("key_epoch") or 0,
+            "needs_rotation": bool(c.get("needs_rotation")), "my_role": m["role"], "wrapped_key": m.get("wrapped_key"),
             "wrapped_by": pub(people.get(m.get("wrapped_by")), key=True), "member_count": len(cm),
             "members": [{**pub(people[x["user_id"]], key=True), "role": x["role"]} for x in shown if x["user_id"] in people],
             "last_message": shape_message(last) if last else None,
@@ -873,6 +956,11 @@ def create_chat(body: ChatCreate, user: dict = Depends(current_user)):
     if missing:
         raise HTTPException(404, "User not found: " + ", ".join(missing))
 
+    blocked = blocked_pairs(me_id)
+    for n in names:                                    # v8: a block in either direction prevents any new chat
+        if people[n]["id"] in blocked:
+            raise HTTPException(403, f"You can't message @{n}")
+
     direct_key = None
     if body.type == "direct":
         direct_key = "|".join(sorted([me_id, people[names[0]]["id"]]))
@@ -880,18 +968,21 @@ def create_chat(body: ChatCreate, user: dict = Depends(current_user)):
         if existing:
             return {"id": existing["id"], "existing": True}
 
+    for n in names:                                    # v8: honour each person's 'who can message me' setting
+        deny = dm_denied(user, people[n])
+        if deny:
+            raise HTTPException(403, deny)
+    # v8: chat keys are no longer supplied at creation. The first device that opens the chat generates the epoch-1 key and
+    # wraps it for every member device (POST /e2ee/chats/{id}/rotate); the placeholder below is unused.
     keys = {m.username.strip().lower().lstrip("@"): m.wrapped_key for m in body.members}
-    if body.type != "channel":
-        if not body.my_wrapped_key or any(not keys.get(n) for n in names):
-            raise HTTPException(422, "Missing encrypted chat keys for one or more members")
     conv = rows(table("conversations").insert({
         "type": body.type, "title": body.title.strip(), "description": body.description.strip(),
         "creator_id": me_id, "direct_key": direct_key,
     }))[0]
     base = {"conversation_id": conv["id"], "wrapped_by": me_id}
-    table("conversation_members").insert({**base, "user_id": me_id, "role": "owner", "wrapped_key": body.my_wrapped_key}).execute()
+    table("conversation_members").insert({**base, "user_id": me_id, "role": "owner", "wrapped_key": body.my_wrapped_key or "e2ee"}).execute()
     for n in names:
-        table("conversation_members").insert({**base, "user_id": people[n]["id"], "role": "member", "wrapped_key": keys[n]}).execute()
+        table("conversation_members").insert({**base, "user_id": people[n]["id"], "role": "member", "wrapped_key": keys.get(n) or "e2ee"}).execute()
     return {"id": conv["id"], "existing": False}
 
 
@@ -926,8 +1017,20 @@ def send_message(body: SendIn, request: Request, user: dict = Depends(current_us
         if not body.iv:
             raise HTTPException(422, "Messages in chats must be end-to-end encrypted")
         encrypted, iv = True, body.iv
+        if conv["type"] == "direct":                    # v8: blocked pairs cannot exchange messages in an existing chat either
+            peer = first(table("conversation_members").select("user_id").eq("conversation_id", conv["id"]).neq("user_id", user["id"]))
+            if peer and peer["user_id"] in blocked_pairs(user["id"]):
+                raise HTTPException(403, "You can't message this account")
+        cur = conv.get("key_epoch") or 0
+        if cur == 0 or body.key_epoch == 0:             # v8: epoch 0 is the old server-derivable key - never accepted for new messages
+            raise HTTPException(409, "upgrade_required: this chat must be upgraded to end-to-end encryption first")
+        if conv.get("needs_rotation"):
+            raise HTTPException(409, "rotation_required: the chat key must be rotated first")
+        if body.key_epoch != cur:
+            raise HTTPException(409, "stale_epoch: the chat key changed, refresh and try again")
     msg = rows(table("messages").insert({
         "conversation_id": conv["id"], "sender_id": user["id"], "ciphertext": body.ciphertext, "iv": iv, "encrypted": encrypted,
+        "key_epoch": 0 if conv["type"] == "channel" else body.key_epoch,
     }))[0]
     table("conversations").update({"last_message_at": msg["created_at"]}).eq("id", conv["id"]).execute()
     return shape_message(msg)
@@ -950,8 +1053,12 @@ def leave_chat(conversation_id: str, user: dict = Depends(current_user)):
     cid = check_uuid(conversation_id)
     membership(cid, user)
     table("conversation_members").delete().eq("conversation_id", cid).eq("user_id", user["id"]).execute()
+    table("key_wraps").delete().eq("conversation_id", cid).eq("user_id", user["id"]).execute()
     if not rows(table("conversation_members").select("user_id").eq("conversation_id", cid).limit(1)):
         table("conversations").delete().eq("id", cid).execute()
+    else:
+        # v8: membership changed -> the next member to open the chat rotates the key so the leaver can't read new messages
+        table("conversations").update({"needs_rotation": True}).eq("id", cid).neq("type", "channel").execute()
     return {"left": True}
 
 
@@ -973,7 +1080,13 @@ from types import SimpleNamespace  # noqa: E402
 
 import social  # noqa: E402
 
-app.include_router(social.build_router(SimpleNamespace(
+_helpers = SimpleNamespace(
     current_user=current_user, pub=pub, rows=rows, first=first, table=table, now=now, iso=iso, limiter=limiter,
     following_ids=following_ids, viewable_post=viewable_post, shape_posts=shape_posts, membership=membership, valid_path=valid_path,
-)))
+    blocked_pairs=blocked_pairs, get_user=get_user, get_user_by_name=get_user_by_name, dm_denied=dm_denied,
+)
+app.include_router(social.build_router(_helpers))
+
+import e2ee_safety  # noqa: E402  (v8: E2EE key management, blocks, reports, follow requests, group members)
+
+app.include_router(e2ee_safety.build_router(_helpers))

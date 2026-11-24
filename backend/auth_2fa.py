@@ -124,8 +124,13 @@ def delivery_channel(contact: str) -> str:
     return "dev"
 
 
+class OtpDeliveryError(RuntimeError):
+    """The code could not be delivered (bad SMTP credentials, no provider configured, network...).
+    Carries a safe, human-readable reason so the API can surface it instead of the generic 500."""
+
+
 def deliver_otp(contact: str, code: str, purpose: str) -> None:
-    """Send the code. Blocking - run it via BackgroundTasks."""
+    """Send the code. Blocking - run it via BackgroundTasks. Raises OtpDeliveryError on a real failure."""
     text = f"Your LokaChat verification code is {code}. It expires in {settings.OTP_TTL_MINUTES} minutes. Never share it."
     channel = delivery_channel(contact)
     try:
@@ -145,9 +150,13 @@ def deliver_otp(contact: str, code: str, purpose: str) -> None:
         elif settings.OTP_DEV_MODE:
             log.warning("[DEV] %s OTP for %s: %s", purpose, contact, code)
         else:
-            log.error("No OTP delivery provider configured (set SMTP_* / TWILIO_* or OTP_DEV_MODE=true)")
-    except Exception:
+            raise OtpDeliveryError("No email/SMS provider is configured on the server, so the code could not be sent.")
+    except OtpDeliveryError:
+        raise
+    except Exception as e:  # v8: surface the real problem instead of silently claiming the code was sent
         log.exception("OTP delivery failed")
+        wake = "email" if channel == "email" else "SMS"
+        raise OtpDeliveryError(f"Couldn't send the {wake} code right now. Please try again in a moment.") from e
 
 
 # --------------------------------------------------------------------- TOTP

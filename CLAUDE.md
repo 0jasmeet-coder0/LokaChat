@@ -1,4 +1,4 @@
-# LokaChat — Project Spec (v7)
+# LokaChat — Project Spec (v8)
 
 Mobile-first, desktop-responsive social app: YouTube-style video hub, Instagram-style follows, stories, reels and notes,
 WhatsApp/Instagram-style end-to-end encrypted chat, authenticator (TOTP) vault.
@@ -65,9 +65,8 @@ Scrollbars: vertical 3px, thumb `#222630`, transparent track; horizontal scrollb
 
 ### Invisible E2EE (WhatsApp style)
 - No lock pills, no "Set up encryption" modals, no "Restore my keys" links. Each open chat starts with a centered `.e2e-banner` (max-width 420px, `#161920`): "Messages in this chat are end-to-end encrypted. No one outside of this chat, not even LokaChat, can read, listen to, or share them."
-- **No ECDH, no per-device keys, no identity/key backup.** `crypto.js` `conversationKey(conversation_id)` = AES-256-GCM key from PBKDF2-SHA256 (100k iterations, salt `lokachat-fallback-conversation-key-v1`, lowercased conversation id), cached per conversation. `chat.js` `convKey(chat)` is used for text and attachments in both directions on every device. New chats store the placeholder `wrapped_key = "fb1"`. Legacy messages with an `"f."` iv prefix decrypt (prefix stripped); old ECDH messages can no longer be decrypted.
+- **v8 supersedes this section.** Chats now use true ECDH P-256 + AES-256-GCM key epochs (see the v8 specification). `crypto.js` `conversationKey(conversation_id)` (PBKDF2-SHA256, 100k iterations, salt `lokachat-fallback-conversation-key-v1`, lowercased conversation id) is retained **only** to read legacy epoch-0 history; new messages are sealed with per-device wrapped conversation keys. New chats store the placeholder `wrapped_key = "e2ee"`; the server derives nothing. Legacy messages with an `"f."` iv prefix decrypt (prefix stripped).
 - Undecryptable old messages render as a subtle pill "Message from earlier session" (`.undec`), no restore link.
-- **Limitation:** the key is derivable from the conversation id + public salt, so chats are access-controlled, not truly end-to-end secret (the server operator could derive it). The banner wording overstates this.
 - Backend `/users/me/key`, `users.key_backup` and `users.public_key` still exist but are unused by the frontend.
 
 ### Music notes + chat media
@@ -81,7 +80,7 @@ Scrollbars: vertical 3px, thumb `#222630`, transparent track; horizontal scrollb
 - Rail order: Home, Reels, Messages, Search, Notifications, Create, Profile; Settings (gear) and More (☰: Saved, Watch history, Security & 2FA vault, Log out) pinned at the bottom (`.rail-bottom{margin-top:auto}`). Pin/collapse arrow (←/→) sits next to the wordmark. Inline SVG favicon in `index.html` (no `/favicon.ico` request).
 
 ### PWA
-- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; network-first for static files; bump `VERSION` on deploys, currently `lokachat-shell-v7-final`), registered in `app.js` (skipped inside Capacitor; the page reloads once when a new worker takes control). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
+- `frontend/manifest.json` (standalone, `#000000`, 192/512 icons), `frontend/service-worker.js` (caches only the same-origin static shell; bypasses `/api`, Supabase, cross-origin, non-GET and range requests; network-first for static files; bump `VERSION` on deploys, currently `lokachat-shell-v8`), registered in `app.js` (skipped inside Capacitor; the page reloads once when a new worker takes control). `viewport-fit=cover`, Apple touch icon and meta tags in `index.html`.
 - Icons: run `node tools/make-icons.js` from the project root to generate `frontend/assets/icon-192.png` and `icon-512.png` (dependency-free). `frontend/assets/icon.svg` is the vector source.
 
 ### Capacitor (Android/iOS)
@@ -192,4 +191,38 @@ Modular, commented, no build step. Escape all interpolated text with `App.esc`. 
 - **Strict format routing**: `App.postFormat(p)` (`views.js`) = `p.format || (clip→reel, video→video, else post)`; `App.openPost` sends reels to `/reels/:id` and videos/photos to `/watch/:id`.
 - `frontend/service-worker.js` `VERSION` bumped to `lokachat-shell-v7-final`.
 - Limitation: the `media` bucket stays public - `allow_download=false` only hides the button. Not verified yet in a live browser.
+
+## v8 specification
+
+### Database - run `backend/migrations/v8.sql` after `v7.sql`
+- New tables: `device_keys` (per-device ECDH P-256 public key), `key_wraps` (one row per conversation × epoch × user × device), `blocks`, `reports`; new columns on `conversations` (`key_epoch`, `needs_rotation`), `users` (`account_private`, `who_can_message`, `who_can_comment`). RLS mirrors the v7 policies.
+
+### True E2EE (`crypto.js`, `chat.js`, `backend/main.py`, `backend/e2ee_safety.py`)
+- **ECDH P-256 per-device identity keys.** `crypto.js ensureDevice()` generates an ECDH P-256 key pair, persists it as JWK in `localStorage` key `loka_device_keys_v8`, and `chat.js ensureDevice()` registers the public JWK via `POST /e2ee/devices`. The private key never leaves the device.
+- **Key epochs.** `conversations.key_epoch` = 0 means legacy server-derivable history (read via `conversationKey`); ≥ 1 means true E2EE. Each epoch's AES-256-GCM conversation key is generated client-side (`generateConversationKey`) and wrapped for **every member device** with an ephemeral ECDH key + HKDF-SHA256 (`wrapKey`/`unwrapKey`); only the ciphertext rows land in `key_wraps`.
+- **Rotation.** `ensureChatKey(chat)` unwraps this device's current key; when `key_epoch` is 0, `needs_rotation` is set, or this device has no wrap, `rotateChat()` mints epoch+1 and `POST /e2ee/chats/{id}/rotate` stores the wraps. Opening a chat is what triggers the first rotation to epoch 1 (and group key rotation on membership change).
+- **Server epoch guards** (`main.py send_message`): epoch 0 → 409 `upgrade_required`; `needs_rotation` → 409 `rotation_required`; stale epoch → 409 `stale_epoch`. `chat.js transmit` catches the 409, calls `App.e2ee.reset()` and retries once against the fresh epoch.
+- **Text and private media are encrypted at rest.** Attachment bytes upload AES-256-GCM sealed (`encryptBytes`, `chat.js` `keyForEpoch`); global feeds, profiles, channels and public `media` stay plaintext.
+- **Boundaries (honest):** E2EE covers 1:1 and group **private** chats only - channels, notes, comments, posts and stories are plaintext. The device key is non-extractable in the browser tab but recovery is per-device: clearing site data loses old history (undecryptable rows show the `.undec` pill). No cross-device key backup yet.
+
+### Google sign-in callback fix (`auth.js`)
+- The OAuth redirect is handled for both the PKCE `?code=` exchange and the implicit `#access_token=` flow: on load `auth.js` parses the URL hash **and** query, exchanges the code (or adopts the token) exactly once, then scrubs the parameters with `history.replaceState`. This removes the spurious **"Google sign-in expired"** toast that appeared when the second callback shape arrived.
+
+### Auth hardening (`backend/auth_2fa.py`, `main.py`)
+- `auth_2fa.deliver_otp` raises `OtpDeliveryError` with a safe, human message when SMTP/SMS delivery fails or no provider is configured; `POST /api/auth/signup` (`send_otp_to`) catches it and returns HTTP 502 instead of the generic 500.
+
+### Mobile chrome: bottom nav, top bars, scroll (`index.html`, `style.css`, `app.js`)
+- Bottom nav is `Home | Search | Chats | You` (`#bottomnav`). It follows **hide-on-scroll** (`body.chrome-hidden` slides `#topbar` up and `#bottomnav` down; `app.js initHideOnScroll` tracks Home/Search/Chats/You with an 18px/14px threshold, always shown near the top).
+- On Reels and inside a conversation the chrome is hidden entirely: `body[data-route="reels"]` hides `#topbar` + `#bottomnav`; `body.in-chat` does the same and expands the chat to `100dvh`.
+- **Per-page top bar:** the wordmark is replaced on mobile by `#tb-page` (`.tb-page`), whose title `app.js App.onRouted` sets per route (Home / Search / Chats / You).
+- **Locked 100dvh chat** (`<768px`): `.conv` is a flex column - `.conv-head` (user/info) and `.composer` are `flex:none`, only `.chat-scroll` scrolls; `body.in-chat .chat-wrap.has-conv { height:100dvh }` plus safe-area padding.
+
+### Screens
+- **Music Note window** (`v6.js` `App.musicLibrary`): auto-fit modal (`.note-win` flex column), auto-plays the first track, keeps the 5/10/15/30 s trimmer (`clipSelector`), and uses **vertical text actions** per row (`.mlib-acts`: blue Preview / Select / Save, red Remove).
+- **Me page** (`you.js`): horizontal action row `.ph-actions` = **Edit profile · Share profile · `+` add contact**; Log out lives only inside Settings. Privacy, blocked accounts and report controls are rendered from `.seg`/`.seg-b` and `.blk-row` (`views.js` profile modal).
+- **Player** (`watch.js`): top-right `⚙️` gear opens the `.vp-sheet` (quality / speed / captions); **swipe up = fullscreen, swipe down = miniplayer**; grey Description + Comments cards (`.w-card`); comment composer sends with the `➤` arrow (`.cm-send`); Auto-CC reads the video's own `<track>`.
+- **Reels** (`watch.js`, `v6.js`): full-height `100dvh` snap feed; **swipe left → Home, swipe right → Search** (v6.js `swipe()` special-cases `reels`).
+- **Search** (`v6.js`): the trending grid is a **Reels-only 9:16 rectangular grid** (`.explore` grid + `.ex-tile { aspect-ratio: 9/16 }`).
+- `frontend/service-worker.js` `VERSION` bumped to `lokachat-shell-v8`.
+- Status: frontend passes `node --check`; **Python is not installed in this environment**, so `backend/` is reviewed by reading, not compiled.
 

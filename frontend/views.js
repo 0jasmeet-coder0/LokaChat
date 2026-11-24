@@ -474,11 +474,36 @@
       if (u.is_following) S.following.add(u.username); else S.following.delete(u.username);
       modal(`<div class="profile-head">${avatar(u, "xl")}<div class="grow"><h3 style="padding:0">${esc(u.display_name)}</h3><div class="muted">@${esc(u.username)}</div>
         <div class="stats"><div><b>${u.posts != null ? u.posts : f.posts.length}</b><span class="muted small">posts</span></div><div><b>${u.followers}</b><span class="muted small">followers</span></div><div><b>${u.following}</b><span class="muted small">following</span></div></div>
-        <div class="row">${App.followBtn(u)}<button class="btn sm" data-action="dm" data-user="${esc(u.username)}">Message</button></div></div></div>
+        <div class="row">${App.followBtn(u)}<button class="btn sm" data-action="dm" data-user="${esc(u.username)}">Message</button><button class="btn sm" data-action="report" data-type="user" data-id="${esc(u.id)}" data-label="@${esc(u.username)}">Report</button><button class="btn sm danger" data-action="block" data-user="${esc(u.username)}">Block</button></div></div></div>
         ${u.bio ? `<p style="white-space:pre-wrap">${esc(u.bio)}</p>` : ""}
         ${f.posts.length ? `<div class="mini-grid">${f.posts.map((p) => `<div class="vcard" data-action="open-post" data-id="${esc(p.id)}"><div class="thumb sq">${App.postThumb(p) ? `<img src="${esc(App.postThumb(p))}" alt="" loading="lazy">` : `<span class="c-ph">${esc((p.caption || p.title || "").slice(0, 60))}</span>`}</div></div>`).join("")}</div>`
           : App.emptyBox("play", "No posts yet", "")}`, { cls: "wide", noFocus: true });
     } catch (e) { fail(e); }
   }
   App.openProfile = openProfile;
+
+  // ============================================================ v8: report / block (community safety)
+  const REPORT_REASONS = [["spam", "Spam"], ["harassment", "Harassment or bullying"], ["hate", "Hate speech"], ["violence", "Violence"], ["nudity", "Nudity or sexual content"], ["scam", "Scam or fraud"], ["self_harm", "Self-harm"], ["impersonation", "Impersonation"], ["other", "Something else"]];
+  /** Open the shared report sheet. `el` carries data-type / data-id / data-label (optionally data-user). */
+  App.actions.report = (el) => {
+    const type = el.dataset.type || "user", id = el.dataset.id || "", label = el.dataset.label || "this";
+    modal(`<h3>Report</h3><p class="muted small">You're reporting <b>${esc(label)}</b>. Reports are anonymous and reviewed by moderators.</p>
+      <form data-form="report" data-type="${esc(type)}" data-id="${esc(id)}" data-user="${esc(el.dataset.user || "")}">
+        <div class="field"><label>Why are you reporting this?</label><select name="reason">${REPORT_REASONS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select></div>
+        <div class="field"><label>More details (optional)</label><textarea name="details" maxlength="1000" rows="3"></textarea></div>
+        <div class="modal-actions"><button class="btn primary" type="submit">Submit report</button></div></form>`);
+  };
+  App.forms.report = async (form, data) => {
+    await api.post("/users/report", { target_type: form.dataset.type, target_id: form.dataset.id, reason: data.reason, details: (data.details || "").trim() });
+    form.closest(".modal-back").remove();
+    toast("Report submitted — thanks for keeping LokaChat safe");
+  };
+  App.actions.block = async (el) => {
+    const username = el.dataset.user;
+    if (!username || !(await App.confirm("Block @" + username + "?", "They won't be able to find your profile, follow you or message you, and any follow between you is removed.", "Block", true))) return;
+    await api.post("/users/block", { username, block: true });
+    App.closeAllModals();
+    if (S.following) S.following.delete(username);
+    toast("Blocked @" + username);
+  };
 })();

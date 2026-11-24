@@ -137,6 +137,10 @@ class ProfileUpdate(BaseModel):
     display_name: Optional[str] = Field(default=None, min_length=1, max_length=40)
     bio: Optional[str] = Field(default=None, max_length=160)
     avatar_path: Optional[str] = Field(default=None, max_length=300)
+    # v8: community safety / privacy controls
+    account_privacy: Optional[Literal["public", "private"]] = None
+    who_can_message: Optional[Literal["everyone", "followers", "nobody"]] = None
+    who_can_comment: Optional[Literal["everyone", "followers", "nobody"]] = None
 
 
 class KeyIn(BaseModel):
@@ -232,10 +236,108 @@ class SendIn(BaseModel):
     conversation_id: str
     ciphertext: str = Field(min_length=1, max_length=12000)
     iv: str = Field(default="", max_length=100)
+    key_epoch: int = Field(default=0, ge=0, le=1_000_000)   # v8: which conversation key epoch sealed this message
 
     @field_validator("conversation_id")
     @classmethod
     def _id(cls, v): return check_uuid(v)
+
+
+# ---------------------------------------------------------------- v8: E2EE key management
+HEX_ID_RE = re.compile(r"^[a-f0-9]{16,64}$")
+
+
+def clean_jwk(v: str, what: str = "public key") -> str:
+    """Accept only an EC P-256 PUBLIC JWK (never a private key) and re-serialise it canonically."""
+    import json
+    try:
+        j = json.loads(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid {what}")
+    if not isinstance(j, dict) or j.get("kty") != "EC" or j.get("crv") != "P-256" or "d" in j:
+        raise ValueError(f"Invalid {what}")
+    x, y = j.get("x"), j.get("y")
+    if not (isinstance(x, str) and isinstance(y, str) and 20 <= len(x) <= 64 and 20 <= len(y) <= 64):
+        raise ValueError(f"Invalid {what}")
+    return json.dumps({"kty": "EC", "crv": "P-256", "x": x, "y": y}, separators=(",", ":"))
+
+
+class DeviceIn(BaseModel):
+    device_id: str
+    public_key: str = Field(min_length=20, max_length=600)
+    label: str = Field(default="", max_length=60)
+
+    @field_validator("device_id")
+    @classmethod
+    def _d(cls, v):
+        if not HEX_ID_RE.match(v or ""):
+            raise ValueError("Invalid device id")
+        return v
+
+    @field_validator("public_key")
+    @classmethod
+    def _k(cls, v): return clean_jwk(v)
+
+
+class WrapItem(BaseModel):
+    user_id: str
+    device_id: str
+    eph_pub: str = Field(min_length=20, max_length=600)
+    wrapped: str = Field(min_length=20, max_length=600)
+
+    @field_validator("user_id")
+    @classmethod
+    def _u(cls, v): return check_uuid(v)
+
+    @field_validator("device_id")
+    @classmethod
+    def _d(cls, v):
+        if not HEX_ID_RE.match(v or ""):
+            raise ValueError("Invalid device id")
+        return v
+
+    @field_validator("eph_pub")
+    @classmethod
+    def _e(cls, v): return clean_jwk(v, "ephemeral key")
+
+
+class WrapsIn(BaseModel):
+    epoch: int = Field(ge=1, le=1_000_000)
+    wraps: List[WrapItem] = Field(min_length=1, max_length=400)
+
+
+class RotateIn(WrapsIn):
+    """Start epoch `epoch` (= current + 1) with a fresh random key wrapped for every active member device."""
+    pass
+
+
+class BackupIn(BaseModel):
+    backup: str = Field(min_length=20, max_length=600_000)   # sealed by the client with the user's recovery key (opaque)
+
+
+class AddMembersIn(BaseModel):
+    usernames: List[str] = Field(min_length=1, max_length=20)
+
+
+# ---------------------------------------------------------------- v8: community safety
+REPORT_REASONS = ("spam", "harassment", "hate", "violence", "nudity", "scam", "self_harm", "impersonation", "other")
+
+
+class BlockIn(BaseModel):
+    username: str = Field(min_length=1, max_length=40)
+    block: bool = True
+
+
+class ReportIn(BaseModel):
+    target_type: Literal["user", "post", "comment", "message"]
+    target_id: str = Field(min_length=1, max_length=64)
+    reason: Literal["spam", "harassment", "hate", "violence", "nudity", "scam", "self_harm", "impersonation", "other"]
+    details: str = Field(default="", max_length=1000)
+
+
+class FollowRequestIn(BaseModel):
+    username: str = Field(min_length=1, max_length=40)
+    approve: bool = True
 
 
 def clean_gif(v) -> str:

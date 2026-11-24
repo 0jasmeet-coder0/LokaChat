@@ -1,10 +1,17 @@
 /* =====================================================================
-   LokaChat - crypto.js   (WebCrypto only, no dependencies)
-   - Message encryption: ONE symmetric AES-256-GCM key per conversation, derived with PBKDF2/SHA-256 from the
-     conversation id + a fixed app salt. There are NO per-device key pairs, so every device (PC, phone, new browser)
-     derives the same key and can read and send in every chat.
-   - Local vault: PBKDF2 -> AES-GCM sealed JSON
-   - TOTP (RFC 6238, HMAC-SHA1) + base32 + otpauth:// parsing
+   LokaChat - crypto.js   (v8, WebCrypto only, no dependencies)
+
+   TRUE end-to-end encryption for PRIVATE chats (direct + group):
+     * every device owns an ECDH P-256 identity key pair (the PRIVATE key never leaves the device)
+     * every conversation has a random AES-256-GCM key per "epoch"
+     * that key is wrapped for each member DEVICE with ephemeral ECDH -> HKDF-SHA256 -> AES-256-GCM
+       (the server only ever sees public keys and opaque wrapped blobs)
+     * adding/removing a member or device rotates the key (a new epoch), so leavers can't read new messages
+
+   Channels stay public/plaintext. Old messages keep decrypting with the legacy server-derivable key
+   (conversationKey / PBKDF2) - that path is kept ONLY for reading pre-v8 history.
+
+   Also: local vault (PBKDF2-sealed JSON), encrypted key backup, TOTP (RFC 6238) + base32 + otpauth://.
    ===================================================================== */
 (function () {
   "use strict";
@@ -12,7 +19,7 @@
   const enc = new TextEncoder();
   const dec = new TextDecoder();
 
-  // ---------- base64 helpers ----------
+  // ---------- base64 / random helpers ----------
   const b64 = (buf) => {
     const bytes = new Uint8Array(buf);
     let s = "";
@@ -21,11 +28,10 @@
   };
   const unb64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
   const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+  const hex = (buf) => Array.from(new Uint8Array(buf), (x) => x.toString(16).padStart(2, "0")).join("");
 
-  // ---------- conversation key (the ONLY message key) ----------
-  // Deterministic: PBKDF2-SHA256(conversation_id, app salt) -> AES-256-GCM. Anyone who knows the conversation id and
-  // this app salt can derive the key (including the server operator), so this protects messages at the level of
-  // access control, not true end-to-end secrecy.
+  // ==================================================== symmetric (legacy + shared)
+  // Fallback key for messages sent BEFORE v8 (server-derivable; kept for reading old history only).
   const fbCache = new Map();
   async function conversationKey(conversationId) {
     const id = String(conversationId || "");
@@ -37,7 +43,6 @@
     return key;
   }
 
-  // ---------- message encryption ----------
   async function encryptText(key, text) {
     const iv = rand(12);
     const ct = await subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(text));
@@ -61,7 +66,94 @@
     return subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12) }, key, bytes.slice(12));
   }
 
-  // ---------- local vault (sealed with a passphrase) ----------
+  /** Import a raw 32-byte AES key. `extractable` is needed when the key must be wrapped for other devices. */
+  const importRawKey = (raw, extractable = true) =>
+    subtle.importKey("raw", raw, { name: "AES-GCM", length: 256 }, extractable, ["encrypt", "decrypt"]);
+  const exportRawKey = async (key) => new Uint8Array(await subtle.exportKey("raw", key));
+  const generateConversationKey = () => rand(32);
+
+  // ==================================================== ECDH P-256 device identity
+  const DEVICE_ID_KEY = "loka_device_id_v8";
+  const DEVICE_KEY_KEY = "loka_device_keys_v8";
+  let deviceCache = null;
+
+  function deviceId() {
+    let id = null;
+    try { id = localStorage.getItem(DEVICE_ID_KEY); } catch (e) { /* ignore */ }
+    if (!id || !/^[a-f0-9]{16,64}$/.test(id)) {
+      id = hex(rand(16)); // 32 hex chars
+      try { localStorage.setItem(DEVICE_ID_KEY, id); } catch (e) { /* ignore */ }
+    }
+    return id;
+  }
+
+  /** Compact public JWK (exactly what the server accepts: kty/crv/x/y, never a private key). */
+  const publicJwk = (dev) => JSON.stringify({ kty: "EC", crv: "P-256", x: dev.pubJwk.x, y: dev.pubJwk.y });
+
+  /** Load this device's ECDH identity key pair, generating + persisting it on first use. */
+  async function ensureDevice() {
+    if (deviceCache) return deviceCache;
+    const id = deviceId();
+    let privateKey = null, pubJwk = null;
+    try {
+      const stored = JSON.parse(localStorage.getItem(DEVICE_KEY_KEY) || "null");
+      if (stored && stored.privateKey && stored.publicKey) {
+        privateKey = await subtle.importKey("jwk", stored.privateKey, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveKey", "deriveBits"]);
+        pubJwk = stored.publicKey;
+      }
+    } catch (e) { privateKey = null; pubJwk = null; }
+    if (!privateKey || !pubJwk) {
+      const kp = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey", "deriveBits"]);
+      const pub = await subtle.exportKey("jwk", kp.publicKey);
+      const priv = await subtle.exportKey("jwk", kp.privateKey);
+      pubJwk = { kty: pub.kty, crv: pub.crv, x: pub.x, y: pub.y };
+      try { localStorage.setItem(DEVICE_KEY_KEY, JSON.stringify({ publicKey: pubJwk, privateKey: priv })); } catch (e) { /* ignore */ }
+      privateKey = await subtle.importKey("jwk", priv, { name: "ECDH", namedCurve: "P-256" }, false, ["deriveKey", "deriveBits"]);
+    }
+    deviceCache = { id, privateKey, pubJwk, publicKey: publicJwk({ pubJwk }) };
+    return deviceCache;
+  }
+
+  /** Forget this device's identity (used by "sign out everywhere" / reset). */
+  function forgetDevice() {
+    deviceCache = null;
+    try { localStorage.removeItem(DEVICE_KEY_KEY); } catch (e) { /* ignore */ }
+  }
+
+  // ==================================================== key wrapping (ECDH-ES + HKDF + AES-GCM)
+  const HKDF_SALT = "lokachat-e2ee-v1";
+  const HKDF_INFO = "lokachat-key-wrap";
+
+  async function kekFrom(myPrivate, theirPublic) {
+    const bits = new Uint8Array(await subtle.deriveBits({ name: "ECDH", public: theirPublic }, myPrivate, 256));
+    const base = await subtle.importKey("raw", bits, "HKDF", false, ["deriveKey"]);
+    return subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt: enc.encode(HKDF_SALT), info: enc.encode(HKDF_INFO) },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+
+  /** Wrap the raw conversation key for one recipient device. Returns { eph_pub, wrapped }. */
+  async function wrapKey(recipientPubJwk, rawKey) {
+    const jwk = typeof recipientPubJwk === "string" ? JSON.parse(recipientPubJwk) : recipientPubJwk;
+    const theirPub = await subtle.importKey("jwk", { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y }, { name: "ECDH", namedCurve: "P-256" }, false, []);
+    const eph = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveKey", "deriveBits"]);
+    const kek = await kekFrom(eph.privateKey, theirPub);
+    const iv = rand(12);
+    const ct = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv }, kek, rawKey));
+    const packed = new Uint8Array(12 + ct.length); packed.set(iv); packed.set(ct, 12);
+    const ephJwk = await subtle.exportKey("jwk", eph.publicKey);
+    return { eph_pub: JSON.stringify({ kty: "EC", crv: "P-256", x: ephJwk.x, y: ephJwk.y }), wrapped: b64(packed) };
+  }
+
+  /** Unwrap an epoch key addressed to this device. Returns the raw 32-byte AES key. */
+  async function unwrapKey(devicePrivateKey, ephPub, wrapped) {
+    const jwk = typeof ephPub === "string" ? JSON.parse(ephPub) : ephPub;
+    const eph = await subtle.importKey("jwk", { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y }, { name: "ECDH", namedCurve: "P-256" }, false, []);
+    const kek = await kekFrom(devicePrivateKey, eph);
+    const packed = unb64(wrapped);
+    return new Uint8Array(await subtle.decrypt({ name: "AES-GCM", iv: packed.slice(0, 12) }, kek, packed.slice(12)));
+  }
+
+  // ==================================================== encrypted key backup
   async function passKey(pass, salt) {
     const base = await subtle.importKey("raw", enc.encode(pass), "PBKDF2", false, ["deriveKey"]);
     return subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt, iterations: 250000 }, base,
@@ -72,6 +164,21 @@
     const ct = await subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(obj)));
     return { salt: b64(salt), iv: b64(iv), ct: b64(ct) };
   }
+
+  /** Seal arbitrary JSON (e.g. the device private key) into one portable, password-protected string. */
+  async function backupSeal(pass, obj) {
+    const salt = rand(16);
+    const key = await passKey(pass, salt);
+    return b64(enc.encode(JSON.stringify(await sealJson(key, salt, obj))));
+  }
+  async function backupOpen(pass, blob) {
+    const sealed = JSON.parse(dec.decode(unb64(blob)));
+    const key = await passKey(pass, unb64(sealed.salt));
+    const pt = await subtle.decrypt({ name: "AES-GCM", iv: unb64(sealed.iv) }, key, unb64(sealed.ct)); // throws on wrong pass
+    return JSON.parse(dec.decode(pt));
+  }
+
+  // ==================================================== local vault (authenticator secrets)
   async function vaultCreate(pass, obj) {
     const salt = rand(16);
     const key = await passKey(pass, salt);
@@ -84,7 +191,7 @@
     return { key, salt, data: JSON.parse(dec.decode(pt)) };
   }
 
-  // ---------- TOTP ----------
+  // ==================================================== TOTP
   const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
   function base32ToBytes(s) {
     const clean = s.toUpperCase().replace(/[\s=-]/g, "");
@@ -133,6 +240,14 @@
   }
 
   window.LokaCrypto = {
-    conversationKey, encryptText, decryptText, encryptBytes, decryptBytes, vaultCreate, vaultOpen, sealJson, totp, parseOtpauth, base32ToBytes,
+    // symmetric / legacy
+    conversationKey, encryptText, decryptText, encryptBytes, decryptBytes,
+    importRawKey, exportRawKey, generateConversationKey,
+    // ECDH P-256 device identity + key wrapping
+    deviceId, ensureDevice, forgetDevice, publicJwk, wrapKey, unwrapKey,
+    // encrypted key backup + vault + TOTP
+    backupSeal, backupOpen, vaultCreate, vaultOpen, sealJson, totp, parseOtpauth, base32ToBytes,
+    // small utils
+    b64, unb64,
   };
 })();

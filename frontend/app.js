@@ -160,20 +160,22 @@
   // v7: YouTube/Instagram style "hide-on-scroll" chrome state (top bar + bottom nav)
   let chromeY = 0, chromeAcc = 0;
   const setChrome = (hidden) => document.body.classList.toggle("chrome-hidden", hidden);
+  const PAGE_TITLE = { home: "Home", search: "Search", messages: "Chats", you: "You" };
   App.onRouted = (name) => {
     const pill = $("#msg-pill-wrap");
     if (pill) pill.classList.toggle("gone", name === "messages");
+    const tb = $("#tb-page"); if (tb) tb.textContent = PAGE_TITLE[name] || "";   // v8: per-page top bar title
     chromeY = 0; chromeAcc = 0; setChrome(false);   // reset the scroll chrome on every route change
     App.closeMenus();
   };
 
   /**
    * Hide the top bar + bottom nav while scrolling down and reveal them on scroll up
-   * (Home/Messages on mobile). Listeners use capture so the internal scrollers
-   * (.chat-scroll, .msgs) drive the same behaviour as the window.
+   * (Home / Search / Messages / You on mobile). Listeners use capture so the internal
+   * scrollers (.chat-scroll, .msgs) drive the same behaviour as the window.
    */
   function initHideOnScroll() {
-    const ROUTES = { home: 1, messages: 1 };
+    const ROUTES = { home: 1, search: 1, messages: 1, you: 1 };
     const isMobile = () => window.matchMedia("(max-width: 767px)").matches;
     const onScroll = (ev) => {
       const t = ev.target;
