@@ -327,7 +327,7 @@ body.pinned .rail-space { width: var(--rail-w-open); }
 .reel-info { position: absolute; z-index: 4; left: calc(50% - var(--w) / 2 + 14px); bottom: 18px; width: calc(var(--w) - 28px); color: #fff; display: grid; gap: 8px; pointer-events: none; }
 .reel-info > * { pointer-events: auto; }
 .reel-info .row { gap: 8px; }
-.reel-cap { font-size: 14px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.reel-cap { font-size: 14px; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .pill-follow { padding: 4px 12px; border-radius: 8px; border: 1px solid #fff; font-weight: 700; font-size: 13px; color: #fff; background: transparent; }
 .pill-follow.primary { background: #fff; color: #000; }
 .ticker { overflow: hidden; white-space: nowrap; font-size: 13px; width: 70%; }
